@@ -149,6 +149,10 @@ struct Opts {
     #[clap(long = "no-slice-boost", action = clap::ArgAction::SetTrue)]
     no_slice_boost: bool,
 
+    /// Disable dynamic slice boost for long-running tasks.
+    #[clap(long = "per-cpu-dsq", action = clap::ArgAction::SetTrue)]
+    per_cpu_dsq: bool,
+
     ///
     /// Disable core compaction so the scheduler uses all the online CPUs.
     /// The core compaction attempts to minimize the number of actively used
@@ -520,6 +524,7 @@ impl<'a> Scheduler<'a> {
         rodata.no_use_em = opts.no_use_em as u8;
         rodata.no_wake_sync = opts.no_wake_sync;
         rodata.no_slice_boost = opts.no_slice_boost;
+        rodata.per_cpu_dsq = opts.per_cpu_dsq;
 
         skel.struct_ops.lavd_ops_mut().flags = *compat::SCX_OPS_ENQ_EXITING
             | *compat::SCX_OPS_ENQ_LAST
