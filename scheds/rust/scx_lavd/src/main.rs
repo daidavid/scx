@@ -54,6 +54,7 @@ use scx_utils::try_set_rlimit_infinity;
 use scx_utils::uei_exited;
 use scx_utils::uei_report;
 use scx_utils::EnergyModel;
+use scx_utils::Topology;
 use scx_utils::UserExitInfo;
 use scx_utils::NR_CPU_IDS;
 use stats::SchedSample;
@@ -159,6 +160,13 @@ struct Opts {
     /// highly experimental feature.
     #[clap(long = "per-cpu-dsq", action = clap::ArgAction::SetTrue)]
     per_cpu_dsq: bool,
+
+    /// For Advanced Users only, this enables customized sizing of Compute Domains.
+    /// The Number specified must be divisable by the smaller number of CPUs
+    /// across all L3 cache domains. This is useful when there are a large number
+    /// of CPUs within a cache domain to reduce contention on shared DSQs.
+    #[clap(long = "cpdom-size")]
+    cpdom_size: Option<u32>,
 
     ///
     /// Disable core compaction so the scheduler uses all the online CPUs.
@@ -331,6 +339,24 @@ struct Scheduler<'a> {
 }
 
 impl<'a> Scheduler<'a> {
+    fn validate_cpdom_size(cpdom_size: u32) {
+        // Use the Topology class to get comprehensive LLC information
+        let topology = Topology::new().expect("Failed to create CPU topology");
+
+        // Find the minimum number of CPUs across all LLCs
+        let min_cpus_per_llc = topology.all_llcs.iter()
+            .map(|(_, llc)| llc.all_cpus.len())
+            .min()
+            .unwrap_or(1);
+
+        if cpdom_size == 0 || cpdom_size > min_cpus_per_llc as u32 || min_cpus_per_llc as u32 % cpdom_size != 0 {
+            panic!(
+                "Invalid cpdom-size: {} (min CPUs per LLC: {})",
+                cpdom_size, min_cpus_per_llc
+            );
+        }
+    }
+
     fn init(opts: &'a Opts, open_object: &'a mut MaybeUninit<OpenObject>) -> Result<Self> {
         if *NR_CPU_IDS > LAVD_CPU_ID_MAX as usize {
             panic!(
@@ -358,9 +384,13 @@ impl<'a> Scheduler<'a> {
                 }
             }
         }
+        if let Some(cpdom_size) = opts.cpdom_size {
+            Self::validate_cpdom_size(cpdom_size);
+        }
 
         // Initialize CPU topology
-        let order = CpuOrder::new().unwrap();
+        let order = CpuOrder::new(opts.cpdom_size.unwrap_or(0))?;
+
         Self::init_cpus(&mut skel, &order);
         Self::init_cpdoms(&mut skel, &order);
 

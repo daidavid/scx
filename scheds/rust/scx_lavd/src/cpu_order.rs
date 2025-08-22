@@ -39,6 +39,7 @@ pub struct CpuId {
     pub pd_adx: usize,
     pub llc_adx: usize,
     pub llc_rdx: usize,
+    pub core_adx: usize,
     pub core_rdx: usize,
     pub cpu_rdx: usize,
     pub cpu_adx: usize,
@@ -56,6 +57,7 @@ pub struct ComputeDomainId {
     pub llc_adx: usize,
     pub llc_rdx: usize,
     pub is_big: bool,
+    pub cpdom_sdx: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -94,11 +96,12 @@ pub struct CpuOrder {
 
 impl CpuOrder {
     /// Build a cpu preference order
-    pub fn new() -> Result<CpuOrder> {
+    pub fn new(cpdom_size: u32) -> Result<CpuOrder> {
         let ctx = CpuOrderCtx::new();
         let cpus_pf = ctx.build_topo_order(false).unwrap();
         let cpus_ps = ctx.build_topo_order(true).unwrap();
-        let cpdom_map = CpuOrderCtx::build_cpdom(&cpus_pf).unwrap();
+        debug!("cpus_pf:{:#?}", cpus_pf);
+        let cpdom_map = CpuOrderCtx::build_cpdom(&cpus_pf, cpdom_size).unwrap();
         let perf_cpu_order = if ctx.em.is_ok() {
             let em = ctx.em.unwrap();
             EnergyModelOptimizer::get_perf_cpu_order_table(&em, &cpus_pf)
@@ -161,7 +164,7 @@ impl CpuOrderCtx {
         // Build a vector of cpu ids.
         for (&numa_adx, node) in self.topo.nodes.iter() {
             for (llc_rdx, (&llc_adx, llc)) in node.llcs.iter().enumerate() {
-                for (core_rdx, (_core_adx, core)) in llc.cores.iter().enumerate() {
+                for (core_rdx, (core_adx, core)) in llc.cores.iter().enumerate() {
                     for (cpu_rdx, (cpu_adx, cpu)) in core.cpus.iter().enumerate() {
                         let cpu_adx = *cpu_adx;
                         let pd_adx = Self::get_pd_id(&self.em, cpu_adx, llc_adx);
@@ -170,6 +173,7 @@ impl CpuOrderCtx {
                             pd_adx,
                             llc_adx,
                             llc_rdx,
+                            core_adx: *core_adx,
                             core_rdx,
                             cpu_rdx,
                             cpu_adx,
@@ -251,16 +255,16 @@ impl CpuOrderCtx {
             //         - pd_adx, core_rdx
             _ => {
                 cpu_ids.sort_by(|a, b| {
-                    a.cpu_rdx
-                        .cmp(&b.cpu_rdx)
+                    a.core_adx
+                        .cmp(&b.core_adx)
                         .then_with(|| a.numa_adx.cmp(&b.numa_adx))
                         .then_with(|| a.llc_rdx.cmp(&b.llc_rdx))
                         .then_with(|| b.cpu_cap.cmp(&a.cpu_cap))
                         .then_with(|| b.cache_size.cmp(&a.cache_size))
                         .then_with(|| a.smt_level.cmp(&b.smt_level))
                         .then_with(|| a.pd_adx.cmp(&b.pd_adx))
-                        .then_with(|| a.core_rdx.cmp(&b.core_rdx))
                         .then_with(|| a.cpu_adx.cmp(&b.cpu_adx))
+                        .then_with(|| a.cpu_rdx.cmp(&b.cpu_rdx))
                 });
             }
         }
@@ -269,13 +273,15 @@ impl CpuOrderCtx {
     }
 
     /// Build a list of compute domains
-    fn build_cpdom(cpu_ids: &Vec<CpuId>) -> Option<BTreeMap<ComputeDomainId, ComputeDomain>> {
+    fn build_cpdom(cpu_ids: &Vec<CpuId>, cpdom_size: u32) -> Option<BTreeMap<ComputeDomainId, ComputeDomain>> {
         // Note that building compute domain is independent to CPU orer
         // so it is okay to use any cpus_*.
 
-        // Creat a compute domain map, where a compute domain is a CPUs that
+        // Create a compute domain map, where a compute domain contains CPUs that
         // are under the same node and LLC and have the same core type.
         let mut cpdom_id = 0;
+        let mut cpu_cnt = 0;
+        let mut cpdom_subdomain_cnt = 0;
         let mut cpdom_map: BTreeMap<ComputeDomainId, ComputeDomain> = BTreeMap::new();
         let mut cpdom_types: BTreeMap<usize, bool> = BTreeMap::new();
         for cpu_id in cpu_ids.iter() {
@@ -284,7 +290,9 @@ impl CpuOrderCtx {
                 llc_adx: cpu_id.llc_adx,
                 llc_rdx: cpu_id.llc_rdx,
                 is_big: cpu_id.big_core,
+                cpdom_sdx: cpdom_subdomain_cnt,
             };
+
             let value = cpdom_map.entry(key.clone()).or_insert_with(|| {
                 let val = ComputeDomain {
                     cpdom_id,
@@ -293,11 +301,16 @@ impl CpuOrderCtx {
                     neighbor_map: RefCell::new(BTreeMap::new()),
                 };
                 cpdom_types.insert(cpdom_id, key.is_big);
-
                 cpdom_id += 1;
                 val
             });
+
             value.cpu_ids.push(cpu_id.cpu_adx);
+
+            cpu_cnt += 1;
+            if cpdom_size != 0 && cpu_cnt % cpdom_size as usize == 0 {
+                cpdom_subdomain_cnt += 1;
+            }
         }
 
         // Build a neighbor map for each compute domain, where neighbors are
