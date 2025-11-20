@@ -456,7 +456,7 @@ static void account_task_runtime(struct task_struct *p,
 				 struct cpu_ctx *cpuc,
 				 u64 now)
 {
-	u64 sus_dur, runtime, svc_time, sc_time;
+	u64 sus_dur, runtime, svc_time, sc_time, exec_delta;
 
 	/*
 	 * Since task execution can span one or more sys_stat intervals,
@@ -466,7 +466,9 @@ static void account_task_runtime(struct task_struct *p,
 	 * execution duration since the last measured time.
 	 */
 	sus_dur = get_suspended_duration_and_reset(cpuc);
-	runtime = time_delta(now, taskc->last_measured_clk + sus_dur);
+	//runtime = time_delta(now, taskc->last_measured_clk + sus_dur);
+	runtime = time_delta(taskc->last_sum_exec_clk, p->se.sum_exec_runtime + sus_dur);
+	taskc->last_sum_exec_clk = p->se.sum_exec_runtime;
 	svc_time = runtime / p->scx.weight;
 	sc_time = scale_cap_freq(runtime, cpuc->cpu_id);
 
@@ -1110,6 +1112,7 @@ void BPF_STRUCT_OPS(lavd_runnable, struct task_struct *p, u64 enq_flags)
 		return;
 	}
 	p_taskc->acc_runtime = 0;
+	p_taskc->last_sum_exec_clk = 0;
 
 	/*
 	 * When a task @p is wakened up, the wake frequency of its waker task
