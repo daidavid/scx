@@ -25,6 +25,27 @@ extern volatile bool		__weak no_core_compaction;
 extern volatile bool		__weak reinit_cpumask_for_performance;
 const volatile bool	__weak is_autopilot_on;
 
+/*
+ * Get the IRQ load for a specific CPU from the kernel's runqueue.
+ * Uses CO-RE to access the avg_irq.util_avg field from the per-CPU runqueue.
+ */
+static u64 get_cpu_irq_load(int cpu)
+{
+	struct rq___local {
+		struct {
+			unsigned long util_avg;
+		} avg_irq;
+	} __attribute__((preserve_access_index));
+
+	extern struct rq runqueues __ksym;
+
+	struct rq___local *rq_l = (void *)bpf_per_cpu_ptr(&runqueues, cpu);
+
+	if (unlikely(!rq_l))
+		return 0;
+	return BPF_CORE_READ(rq_l, avg_irq.util_avg);
+}
+
 int do_autopilot(void);
 u32 calc_avg32(u32 old_val, u32 new_val);
 u64 calc_avg(u64 old_val, u64 new_val);
@@ -315,29 +336,27 @@ static void collect_sys_stat(void)
 		}
 
 		/*
-		 * cpuc->cur_stolen_est is only an estimate of the time stolen by
-		 * irq/steal during execution times. We extrapolate that ratio to
-		 * the rest of CPU time as an approximation.
+		 * Get IRQ utilization directly from the kernel's PELT-tracked
+		 * avg_irq.util_avg. This replaces the previous stolen_time_est
+		 * approach with a more accurate kernel-provided metric.
 		 */
-		cpuc->cur_stolen_est = (cpuc->stolen_time_est << LAVD_SHIFT) / compute;
+		u64 irq_util = get_cpu_irq_load(cpu);
 
 		/*
-		 * Update running average of stolen time using RAVG library.
+		 * Update running average of IRQ utilization using RAVG library.
 		 * Use accumulate/decay with 256ms (1/4 second) half-life.
 		 */
-		ravg_accumulate(&cpuc->avg_stolen_est, cpuc->cur_stolen_est, c->now, 256 * NSEC_PER_MSEC);
+		ravg_accumulate(&cpuc->avg_stolen_est, irq_util, c->now, 256 * NSEC_PER_MSEC);
 
 		/*
-		 * Calculate latency capacity as 1024 - avg_stolen_est.
+		 * Calculate latency capacity as 1024 - avg_irq_util.
 		 * Read the RAVG value, convert from fixed-point, and compute remaining capacity.
 		 */
-		u64 avg_stolen_fp = ravg_read(&cpuc->avg_stolen_est, c->now, 256 * NSEC_PER_MSEC);
-		u32 avg_stolen_val = (u32)(avg_stolen_fp >> RAVG_FRAC_BITS);
-		cpuc->lat_capacity = (avg_stolen_val < 1024) ? (1024 - avg_stolen_val) : 0;
+		u64 avg_irq_fp = ravg_read(&cpuc->avg_stolen_est, c->now, 256 * NSEC_PER_MSEC);
+		u32 avg_irq_val = (u32)(avg_irq_fp >> RAVG_FRAC_BITS);
+		cpuc->lat_capacity = (avg_irq_val < 1024) ? (1024 - avg_irq_val) : 0;
 		/* Add 12.5% headroom for latency capacity */
 		cpuc->lat_capacity = cpuc->lat_capacity + (cpuc->lat_capacity >> 3);
-
-		cpuc->stolen_time_est = 0;
 
 		/*
 		 * Accmulate system-wide idle time.
