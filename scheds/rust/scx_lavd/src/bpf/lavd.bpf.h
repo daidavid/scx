@@ -172,6 +172,8 @@ struct task_ctx {
 	u64	cgrp_id;		/* cgroup id of this task */
 	u64	resched_interval;	/* reschedule interval in ns: [last running, this running] */
 	u64	last_slice_used;	/* time(ns) used in last scheduled interval: [last running, last stopping] */
+	struct ravg_data avg_util_ravg;	/* Running average of task utilization using ravg */
+	volatile u32	util_est;	/* Estimated task utilization from ravg tracking */
 	pid_t	pid;			/* pid for this task */
 	pid_t	waker_pid;		/* last waker's PID */
 	char	waker_comm[TASK_COMM_LEN + 1]; /* last waker's comm */
@@ -264,6 +266,8 @@ struct cpu_ctx {
 	volatile u32	lat_capacity;	/* Latency capacity: 1024 - avg_stolen_est (available capacity for latency-sensitive work) */
 	volatile u32	cur_stolen_est;	/* Estimated irq/steal utilization of the current interval */
 	volatile u64	stolen_time_est; /* Estimated time stolen by steal/irq time on CPU */
+	struct ravg_data avg_util_ravg;	/* Running average of CPU utilization using ravg */
+	volatile u32	util_est;	/* Estimated CPU utilization from ravg tracking */
 	volatile u64	idle_total;	/* total idle time so far */
 	volatile u64	idle_start_clk;	/* when the CPU becomes idle */
 	u64		online_clk;	/* when a CPU becomes online */

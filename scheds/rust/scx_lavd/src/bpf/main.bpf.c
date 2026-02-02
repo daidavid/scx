@@ -483,10 +483,50 @@ static void account_task_runtime(struct task_struct *p,
 	WRITE_ONCE(cpuc->tot_svc_time, cpuc->tot_svc_time + svc_time);
 	WRITE_ONCE(cpuc->tot_sc_time, cpuc->tot_sc_time + sc_time);
 
+	/*
+	 * Update CPU util_est using ravg library.
+	 * Use the current CPU utilization (updated periodically in sys_stat).
+	 */
+	ravg_accumulate(&cpuc->avg_util_ravg, cpuc->cur_util, now, 256 * NSEC_PER_MSEC);
+	u64 cpu_avg_util_fp = ravg_read(&cpuc->avg_util_ravg, now, 256 * NSEC_PER_MSEC);
+	cpuc->util_est = (u32)(cpu_avg_util_fp >> RAVG_FRAC_BITS);
+
 	taskc->acc_runtime += runtime;
 	taskc->svc_time += svc_time;
 	taskc->last_measured_clk = now;
 	taskc->last_sum_exec_clk = task_time;
+
+	/*
+	 * Update task util_est using ravg library.
+	 * Calculate utilization as runtime scaled to [0, 1024].
+	 * We use the accumulated runtime relative to the time since last scheduled.
+	 *
+	 * Since task_ctx is in arena memory, we copy ravg_data to a local
+	 * variable, perform the ravg operations, then copy it back.
+	 */
+	u64 sched_interval = time_delta(now, taskc->last_runnable_clk);
+	if (sched_interval > 0) {
+		u32 cur_util = (taskc->acc_runtime << LAVD_SHIFT) / sched_interval;
+		cur_util = min(cur_util, (u32)LAVD_SCALE);
+
+		/* Copy ravg_data from arena to local stack */
+		struct ravg_data local_ravg;
+		local_ravg.val = taskc->avg_util_ravg.val;
+		local_ravg.val_at = taskc->avg_util_ravg.val_at;
+		local_ravg.old = taskc->avg_util_ravg.old;
+		local_ravg.cur = taskc->avg_util_ravg.cur;
+
+		/* Perform ravg operations on local copy */
+		ravg_accumulate(&local_ravg, cur_util, now, 256 * NSEC_PER_MSEC);
+		u64 avg_util_fp = ravg_read(&local_ravg, now, 256 * NSEC_PER_MSEC);
+
+		/* Copy back to arena and update util_est */
+		taskc->avg_util_ravg.val = local_ravg.val;
+		taskc->avg_util_ravg.val_at = local_ravg.val_at;
+		taskc->avg_util_ravg.old = local_ravg.old;
+		taskc->avg_util_ravg.cur = local_ravg.cur;
+		taskc->util_est = (u32)(avg_util_fp >> RAVG_FRAC_BITS);
+	}
 
 	/*
 	 * Under CPU bandwidth control using cpu.max, we also need to report
