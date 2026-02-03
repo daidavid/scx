@@ -910,13 +910,14 @@ find_latency_available_cpu(struct task_struct *p, task_ctx *taskc, s32 start_cpu
 			/*
 			 * Atomically check if task fits and add util_est.
 			 */
-			bpf_spin_lock(&cpuc->util_lock);
-			if (cpuc->util_est + task_util_est <= LAVD_SCALE) {
-				cpuc->util_est = cpuc->util_est + task_util_est;
-				bpf_spin_unlock(&cpuc->util_lock);
-				return cpu;
+			if (!arena_spin_lock((void __arena *)&cpuc->util_lock)) {
+				if (cpuc->util_est + task_util_est <= LAVD_SCALE) {
+					cpuc->util_est = cpuc->util_est + task_util_est;
+					arena_spin_unlock((void __arena *)&cpuc->util_lock);
+					return cpu;
+				}
+				arena_spin_unlock((void __arena *)&cpuc->util_lock);
 			}
-			bpf_spin_unlock(&cpuc->util_lock);
 		}
 	}
 
