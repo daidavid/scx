@@ -268,6 +268,7 @@ struct cpu_ctx {
 	volatile u64	stolen_time_est; /* Estimated time stolen by steal/irq time on CPU */
 	struct ravg_data avg_util_ravg;	/* Running average of CPU utilization using ravg */
 	volatile u32	util_est;	/* Estimated CPU utilization from ravg tracking */
+	struct bpf_spin_lock util_lock;	/* Lock for util_est updates */
 	volatile u64	idle_total;	/* total idle time so far */
 	volatile u64	idle_start_clk;	/* when the CPU becomes idle */
 	u64		online_clk;	/* when a CPU becomes online */

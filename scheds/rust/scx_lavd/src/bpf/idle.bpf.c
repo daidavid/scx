@@ -814,7 +814,8 @@ unlock_out:
  *
  * Iterates through all CPUs in the same compute domain (cpdom) as @start_cpu
  * and collects all CPUs where lat_capacity >= task's normalized lat_cri,
- * then returns a random CPU from that set.
+ * then iterates through that mask to find a CPU where the task's util_est
+ * will fit, atomically adding the util_est to the chosen CPU.
  *
  * Returns: CPU ID if found, -ENOENT if no suitable CPU found
  */
@@ -825,6 +826,7 @@ find_latency_available_cpu(struct task_struct *p, task_ctx *taskc, s32 start_cpu
 	struct cpu_ctx *start_cpuc, *cpuc;
 	struct cpdom_ctx *cpdomc;
 	u16 normalized_lat_cri;
+	u32 task_util_est;
 	s32 cpu_id = -ENOENT;
 	int i, k;
 
@@ -845,10 +847,11 @@ find_latency_available_cpu(struct task_struct *p, task_ctx *taskc, s32 start_cpu
 	 * This was already calculated in calc_lat_cri().
 	 */
 	normalized_lat_cri = taskc->normalized_lat_cri;
+	task_util_est = taskc->util_est;
 
 	/*
-	 * Iterate through all CPUs in the cpdom to find all CPUs with
-	 * sufficient latency capacity (lat_capacity >= normalized_lat_cri)
+	 * First loop: Iterate through all CPUs in the cpdom to find all CPUs
+	 * with sufficient latency capacity (lat_capacity >= normalized_lat_cri).
 	 */
 	bpf_for(i, 0, LAVD_CPU_ID_MAX/64) {
 		u64 cpumask = cpdomc->__cpumask[i];
@@ -886,10 +889,36 @@ find_latency_available_cpu(struct task_struct *p, task_ctx *taskc, s32 start_cpu
 		}
 	}
 
-	/* Pick a random CPU from all latency-available CPUs */
-	cpu_id = bpf_cpumask_any_distribute(cast_mask(lat_avail_mask));
-	if (cpu_id >= nr_cpu_ids)
-		cpu_id = -ENOENT;
+	/*
+	 * Second loop: Iterate through lat_avail_mask to find a CPU where
+	 * the task's util_est will fit. Read and write util_est atomically
+	 * within the same lock section to avoid race conditions.
+	 */
+	bpf_for(i, 0, LAVD_CPU_ID_MAX/64) {
+		bpf_for(k, 0, 64) {
+			u32 cpu = (i * 64) + k;
+			if (cpu >= nr_cpu_ids)
+				break;
+
+			if (!bpf_cpumask_test_cpu(cpu, cast_mask(lat_avail_mask)))
+				continue;
+
+			cpuc = get_cpu_ctx_id(cpu);
+			if (!cpuc)
+				continue;
+
+			/*
+			 * Atomically check if task fits and add util_est.
+			 */
+			bpf_spin_lock(&cpuc->util_lock);
+			if (cpuc->util_est + task_util_est <= LAVD_SCALE) {
+				cpuc->util_est = cpuc->util_est + task_util_est;
+				bpf_spin_unlock(&cpuc->util_lock);
+				return cpu;
+			}
+			bpf_spin_unlock(&cpuc->util_lock);
+		}
+	}
 
 	return cpu_id;
 }

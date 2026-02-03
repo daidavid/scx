@@ -606,6 +606,20 @@ s32 BPF_STRUCT_OPS(lavd_select_cpu, struct task_struct *p, s32 prev_cpu,
 	if (!ictx.taskc || !ictx.cpuc_cur)
 		return prev_cpu;
 
+	/*
+	 * Subtract task's util_est from prev_cpu's util_est since the task
+	 * is leaving that CPU.
+	 */
+	struct cpu_ctx *prev_cpuc = get_cpu_ctx_id(prev_cpu);
+	if (prev_cpuc) {
+		bpf_spin_lock(&prev_cpuc->util_lock);
+		if (prev_cpuc->util_est >= ictx.taskc->util_est)
+			prev_cpuc->util_est -= ictx.taskc->util_est;
+		else
+			prev_cpuc->util_est = 0;
+		bpf_spin_unlock(&prev_cpuc->util_lock);
+	}
+
 	if (wake_flags & SCX_WAKE_SYNC)
 		set_task_flag(ictx.taskc, LAVD_FLAG_IS_SYNC_WAKEUP);
 	else
