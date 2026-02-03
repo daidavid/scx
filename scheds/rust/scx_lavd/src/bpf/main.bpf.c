@@ -646,8 +646,10 @@ s32 BPF_STRUCT_OPS(lavd_select_cpu, struct task_struct *p, s32 prev_cpu,
 		struct bpf_cpumask *lat_avail_mask = bpf_cpumask_create();
 		if (lat_avail_mask) {
 			s32 lat_cpu = find_latency_available_cpu(p, ictx.taskc, cpu_id, lat_avail_mask);
-			if (lat_cpu >= 0)
+			if (lat_cpu >= 0) {
 				cpu_id = lat_cpu;
+				set_task_flag(ictx.taskc, LAVD_FLAG_LAT_CPU_PICKED);
+			}
 			bpf_cpumask_release(lat_avail_mask);
 		}
 	}
@@ -780,8 +782,10 @@ void BPF_STRUCT_OPS(lavd_enqueue, struct task_struct *p, u64 enq_flags)
 			struct bpf_cpumask *lat_avail_mask = bpf_cpumask_create();
 			if (lat_avail_mask) {
 				s32 lat_cpu = find_latency_available_cpu(p, taskc, cpu, lat_avail_mask);
-				if (lat_cpu >= 0)
+				if (lat_cpu >= 0) {
 					cpu = lat_cpu;
+					set_task_flag(taskc, LAVD_FLAG_LAT_CPU_PICKED);
+				}
 				bpf_cpumask_release(lat_avail_mask);
 			}
 		}

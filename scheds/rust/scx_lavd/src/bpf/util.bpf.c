@@ -335,8 +335,21 @@ bool queued_on_cpu(struct cpu_ctx *cpuc)
 __hidden
 u64 get_target_dsq_id(struct task_struct *p, struct cpu_ctx *cpuc)
 {
+	task_ctx *taskc;
+
 	if (per_cpu_dsq || (pinned_slice_ns && is_pinned(p)))
 		return cpu_to_dsq(cpuc->cpu_id);
+
+	/*
+	 * If a latency-available CPU was picked via find_latency_available_cpu,
+	 * use per-CPU DSQ to ensure the task runs on that specific CPU.
+	 */
+	taskc = get_task_ctx(p);
+	if (taskc && test_task_flag(taskc, LAVD_FLAG_LAT_CPU_PICKED)) {
+		reset_task_flag(taskc, LAVD_FLAG_LAT_CPU_PICKED);
+		return cpu_to_dsq(cpuc->cpu_id);
+	}
+
 	return cpdom_to_dsq(cpuc->cpdom_id);
 }
 
