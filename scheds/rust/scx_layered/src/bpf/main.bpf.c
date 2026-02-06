@@ -109,6 +109,10 @@ struct {
 
 const volatile bool task_hint_map_enabled;
 
+#define __COMPAT_lookup_task_hint_priority(p)					\
+	(bpf_core_field_exists(struct bpf_local_storage_elem, free_node) ?	\
+	 __lookup_task_hint_priority((p)) : NULL)
+
 /* EWMA value updated from userspace */
 u64 system_cpu_util_ewma = 0;
 u64 layer_dsq_insert_ewma[MAX_LAYERS];
@@ -640,7 +644,7 @@ static struct task_ctx *lookup_task_ctx(struct task_struct *p)
 	return taskc;
 }
 
-static u64 *lookup_task_hint_priority(struct task_struct *p)
+static u64 *__lookup_task_hint_priority(struct task_struct *p)
 {
 	struct tld_object tld_obj;
 	u64 *priority;
@@ -665,7 +669,7 @@ static struct hint_layer_info *lookup_task_hint_layer_id(struct task_struct *p) 
 	u64 *priority;
 	u32 hint_val;
 
-	priority = lookup_task_hint_priority(p);
+	priority = __COMPAT_lookup_task_hint_priority(p);
 	if (!priority)
 		return NULL;
 
@@ -2654,7 +2658,7 @@ static __noinline bool match_one(struct layer *layer, struct layer_match *match,
 				avg_runtime_us < match->max_avg_runtime_us;
 	}
 	case MATCH_HINT_EQUALS: {
-		u64 *priority = lookup_task_hint_priority(p);
+		u64 *priority = __COMPAT_lookup_task_hint_priority(p);
 
 		if (!priority)
 			return false;
