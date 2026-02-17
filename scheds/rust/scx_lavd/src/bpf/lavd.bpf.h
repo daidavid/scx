@@ -201,6 +201,7 @@ struct task_ctx {
 	pid_t	waker_pid;		/* last waker's PID */
 	char	waker_comm[TASK_COMM_LEN + 1]; /* last waker's comm */
 	u64	tld_hint_slice_ns;	/* TLD hint: target time slice in ns (0 = no hint) */
+	u16	tld_hint_lat_cri;	/* TLD hint: latency criticality override (0 = no hint) */
 } __attribute__((aligned(CACHELINE_SIZE)));
 
 /*

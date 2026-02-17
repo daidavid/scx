@@ -201,6 +201,7 @@
 
 struct tld_keys {
 	tld_key_t slice_ms_key;
+	tld_key_t lat_cri_key;
 };
 
 #define __COMPAT_lavd_refresh_tld_hints(p, taskc)			\
@@ -302,14 +303,21 @@ static void __lavd_refresh_tld_hints(struct task_struct *p, task_ctx *taskc)
 		taskc->tld_hint_slice_ns = *val * NSEC_PER_MSEC;
 	else
 		taskc->tld_hint_slice_ns = 0;
+
+	/* Read lat_cri hint */
+	val = tld_get_data(&tld_obj, lat_cri_key, "lat_cri", sizeof(*val));
+	if (val && *val > 0)
+		taskc->tld_hint_lat_cri = (u16)*val;
+	else
+		taskc->tld_hint_lat_cri = 0;
 }
 
 static void apply_tld_slice_hint(task_ctx *taskc)
 {
 	if (!taskc->tld_hint_slice_ns)
 		return;
-	if (taskc->slice != taskc->tld_hint_slice_ns) {
-		taskc->slice = taskc->tld_hint_slice_ns;
+	if (taskc->slice_wall != taskc->tld_hint_slice_ns) {
+		taskc->slice_wall = taskc->tld_hint_slice_ns;
 		reset_task_flag(taskc, LAVD_FLAG_SLICE_BOOST);
 	}
 }
