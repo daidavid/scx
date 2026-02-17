@@ -14,6 +14,7 @@
 /*
  * common macros
  */
+
 #define U64_MAX		((u64)~0ULL)
 #define S64_MAX		((s64)(U64_MAX >> 1))
 #define U32_MAX		((u32)~0U)
@@ -199,6 +200,7 @@ struct task_ctx {
 	pid_t	pid;			/* pid for this task */
 	pid_t	waker_pid;		/* last waker's PID */
 	char	waker_comm[TASK_COMM_LEN + 1]; /* last waker's comm */
+	u64	tld_hint_slice_ns;	/* TLD hint: target time slice in ns (0 = no hint) */
 } __attribute__((aligned(CACHELINE_SIZE)));
 
 /*

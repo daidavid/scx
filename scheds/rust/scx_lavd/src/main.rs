@@ -200,6 +200,11 @@ struct Opts {
     #[clap(long = "partial", action = clap::ArgAction::SetTrue)]
     partial: bool,
 
+    /// Set the path for pinning the task hint map for TLD-based hints.
+    /// Enables userspace per-task hints (slice_ms, lat_cri) via task local data.
+    #[clap(long = "task-hint-map", default_value = "")]
+    task_hint_map: String,
+
     ///
     /// Disable core compaction so the scheduler uses all the online CPUs.
     /// The core compaction attempts to minimize the number of actively used
@@ -453,6 +458,11 @@ impl<'a> Scheduler<'a> {
         // Initialize skel according to @opts.
         Self::init_globals(&mut skel, &opts, &order, debug_level);
 
+        // Pin the TLD data map if a path is provided.
+        if !opts.task_hint_map.is_empty() {
+            skel.maps.tld_data_map.set_pin_path(&opts.task_hint_map).unwrap();
+        }
+
         // Initialize arena
         let mut skel = scx_ops_load!(skel, lavd_ops, uei)?;
         let task_size = std::mem::size_of::<types::task_ctx>();
@@ -461,6 +471,17 @@ impl<'a> Scheduler<'a> {
 
         // Attach.
         let struct_ops = Some(scx_ops_attach!(skel, lavd_ops)?);
+
+        // Allow all tasks to open and write to BPF task hint map.
+        if !opts.task_hint_map.is_empty() {
+            let path = std::ffi::CString::new(opts.task_hint_map.as_bytes()).unwrap();
+            unsafe {
+                if libc::chmod(path.as_ptr(), 0o666) != 0 {
+                    info!("chmod of task hint map failed, continuing...");
+                }
+            }
+        }
+
         let stats_server = StatsServer::new(stats::server_data(*NR_CPU_IDS as u64)).launch()?;
 
         // Build a ring buffer for instrumentation
@@ -651,6 +672,7 @@ impl<'a> Scheduler<'a> {
         rodata.no_slice_boost = opts.no_slice_boost;
         rodata.per_cpu_dsq = opts.per_cpu_dsq;
         rodata.enable_cpu_bw = opts.enable_cpu_bw;
+        rodata.task_hint_map_enabled = !opts.task_hint_map.is_empty();
 
         if !ksym_exists("scx_group_set_bandwidth").unwrap() {
             skel.struct_ops.lavd_ops_mut().cgroup_set_bandwidth = std::ptr::null_mut();

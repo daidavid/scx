@@ -194,6 +194,19 @@
 #include <bpf/bpf_tracing.h>
 #include <lib/cgroup.h>
 
+/*
+ * TLD (Task Local Data) support for per-task hinting.
+ */
+#include <scx/task_local_data.bpf.h>
+
+struct tld_keys {
+	tld_key_t slice_ms_key;
+};
+
+#define __COMPAT_lavd_refresh_tld_hints(p, taskc)			\
+	(bpf_core_field_exists(struct bpf_local_storage_elem, free_node) ? \
+	 __lavd_refresh_tld_hints((p), (taskc)) : (void)0)
+
 char _license[] SEC("license") = "GPL";
 
 /*
@@ -224,6 +237,11 @@ const volatile u8	mig_delta_pct = 0;
  * the dispatch logic compares vtimes across DSQs.
  */
 const volatile u64	pinned_slice_ns = 0;
+
+/*
+ * Feature guard for TLD-based task hinting
+ */
+const volatile bool	task_hint_map_enabled;
 
 static volatile u64	nr_cpus_big;
 
@@ -267,6 +285,35 @@ static void advance_cur_logical_clk(struct task_struct *p)
 	}
 }
 
+static void __lavd_refresh_tld_hints(struct task_struct *p, task_ctx *taskc)
+{
+	struct tld_object tld_obj;
+	u64 *val;
+
+	if (!task_hint_map_enabled)
+		return;
+
+	if (tld_object_init(p, &tld_obj))
+		return;
+
+	/* Read slice_ms hint */
+	val = tld_get_data(&tld_obj, slice_ms_key, "slice_ms", sizeof(*val));
+	if (val && *val > 0)
+		taskc->tld_hint_slice_ns = *val * NSEC_PER_MSEC;
+	else
+		taskc->tld_hint_slice_ns = 0;
+}
+
+static void apply_tld_slice_hint(task_ctx *taskc)
+{
+	if (!taskc->tld_hint_slice_ns)
+		return;
+	if (taskc->slice != taskc->tld_hint_slice_ns) {
+		taskc->slice = taskc->tld_hint_slice_ns;
+		reset_task_flag(taskc, LAVD_FLAG_SLICE_BOOST);
+	}
+}
+
 static u64 calc_time_slice(task_ctx *taskc, struct cpu_ctx *cpuc)
 {
 	/*
@@ -283,6 +330,7 @@ static u64 calc_time_slice(task_ctx *taskc, struct cpu_ctx *cpuc)
 	if (pinned_slice_ns && cpuc->nr_pinned_tasks) {
 		taskc->slice_wall = min(pinned_slice_ns, sys_stat.slice_wall);
 		reset_task_flag(taskc, LAVD_FLAG_SLICE_BOOST);
+		apply_tld_slice_hint(taskc);
 		return taskc->slice_wall;
 	}
 
@@ -322,6 +370,7 @@ static u64 calc_time_slice(task_ctx *taskc, struct cpu_ctx *cpuc)
 			taskc->slice_wall = clamp(s, slice_min_ns,
 					     LAVD_SLICE_BOOST_MAX);
 			set_task_flag(taskc, LAVD_FLAG_SLICE_BOOST);
+			apply_tld_slice_hint(taskc);
 			return taskc->slice_wall;
 		}
 
@@ -341,6 +390,7 @@ static u64 calc_time_slice(task_ctx *taskc, struct cpu_ctx *cpuc)
 						 sys_stat.slice_wall * 2));
 
 			set_task_flag(taskc, LAVD_FLAG_SLICE_BOOST);
+			apply_tld_slice_hint(taskc);
 			return taskc->slice_wall;
 		}
 	}
@@ -351,6 +401,7 @@ static u64 calc_time_slice(task_ctx *taskc, struct cpu_ctx *cpuc)
 	 */
 	taskc->slice_wall = sys_stat.slice_wall;
 	reset_task_flag(taskc, LAVD_FLAG_SLICE_BOOST);
+	apply_tld_slice_hint(taskc);
 	return taskc->slice_wall;
 }
 
@@ -630,6 +681,8 @@ s32 BPF_STRUCT_OPS(lavd_select_cpu, struct task_struct *p, s32 prev_cpu,
 		if (!queued_on_cpu(cpuc)) {
 			p->scx.dsq_vtime = calc_when_to_run(p, ictx.taskc);
 			p->scx.slice = LAVD_SLICE_MAX_NS_DFL;
+			if (ictx.taskc->tld_hint_slice_ns)
+				p->scx.slice = ictx.taskc->tld_hint_slice_ns;
 			scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, p->scx.slice, 0);
 			goto out;
 		}
@@ -704,6 +757,8 @@ void BPF_STRUCT_OPS(lavd_enqueue, struct task_struct *p, u64 enq_flags)
 		p->scx.dsq_vtime = calc_when_to_run(p, taskc);
 	}
 	p->scx.slice = LAVD_SLICE_MIN_NS_DFL;
+	if (taskc->tld_hint_slice_ns)
+		p->scx.slice = taskc->tld_hint_slice_ns;
 
 	/*
 	 * Find a proper DSQ for the task, which is either the task's
@@ -1337,6 +1392,22 @@ void BPF_STRUCT_OPS(lavd_tick, struct task_struct *p)
 
 	now = scx_bpf_now();
 	account_task_runtime(p, taskc, cpuc, now);
+
+	/*
+	 * Refresh TLD hints and enforce the slice hint as a target.
+	 */
+	__COMPAT_lavd_refresh_tld_hints(p, taskc);
+	if (taskc->tld_hint_slice_ns) {
+		u64 elapsed = time_delta(now, taskc->last_running_clk);
+		if (elapsed < taskc->tld_hint_slice_ns) {
+			u64 remaining = taskc->tld_hint_slice_ns - elapsed;
+			if (p->scx.slice != remaining)
+				p->scx.slice = remaining;
+		} else {
+			/* Hint budget exhausted, trigger reschedule */
+			p->scx.slice = 0;
+		}
+	}
 
 	/*
 	 * Under the CPU bandwidth control with cpu.max, check if the cgroup
