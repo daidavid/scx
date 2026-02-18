@@ -232,6 +232,7 @@ struct task_ctx {
 	u32	util_est;		/* Estimated task util using ravg duty cycle */
 	struct ravg_data avg_util_ravg;	/* Running average of task utilization using ravg */
 	char	waker_comm[TASK_COMM_LEN + 1]; /* last waker's comm */
+	u64	tld_hint_slice_ns;	/* TLD hint: target time slice in ns (0 = no hint) */
 } __attribute__((aligned(CACHELINE_SIZE)));
 
 /*
