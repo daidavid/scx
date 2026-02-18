@@ -305,26 +305,42 @@ static void __lavd_refresh_tld_hints(struct task_struct *p, task_ctx *taskc)
 {
 	struct tld_object tld_obj;
 	u64 *val;
+	int err;
 
 	if (!task_hint_map_enabled)
 		return;
 
-	if (tld_object_init(p, &tld_obj))
+	err = tld_object_init(p, &tld_obj);
+	if (err) {
+		traceln("tld_init: pid=%d err=%d", p->pid, err);
 		return;
+	}
+
+	debugln("tld_read: pid=%d tld_obj_init ok", p->pid);
 
 	/* Read slice_ms hint */
 	val = tld_get_data(&tld_obj, slice_ms_key, "slice_ms", sizeof(*val));
-	if (val && *val > 0)
+	debugln("tld_read: pid=%d slice_ms val=%llx ptr=%llx",
+		p->pid, val ? *val : 0, (u64)val);
+	if (val && *val > 0) {
+		if (!taskc->tld_hint_slice_ns)
+			debugln("tld_hint: pid=%d slice_ms=%llu", p->pid, *val);
 		taskc->tld_hint_slice_ns = *val * NSEC_PER_MSEC;
-	else
+	} else {
 		taskc->tld_hint_slice_ns = 0;
+	}
 
 	/* Read lat_cri hint */
 	val = tld_get_data(&tld_obj, lat_cri_key, "lat_cri", sizeof(*val));
-	if (val && *val > 0)
+	debugln("tld_read: pid=%d lat_cri val=%llx ptr=%llx",
+		p->pid, val ? *val : 0, (u64)val);
+	if (val && *val > 0) {
+		if (!taskc->tld_hint_lat_cri)
+			debugln("tld_hint: pid=%d lat_cri=%llu", p->pid, *val);
 		taskc->tld_hint_lat_cri = (u16)*val;
-	else
+	} else {
 		taskc->tld_hint_lat_cri = 0;
+	}
 }
 
 static u64 calc_time_slice(task_ctx *taskc, struct cpu_ctx *cpuc)
@@ -1465,6 +1481,10 @@ void BPF_STRUCT_OPS(lavd_tick, struct task_struct *p)
 	/*
 	 * Refresh TLD hints.
 	 */
+	if (task_hint_map_enabled)
+		debugln("tld_compat: pid=%d compat=%d",
+			p->pid,
+			bpf_core_field_exists(struct bpf_local_storage_elem, free_node));
 	__COMPAT_lavd_refresh_tld_hints(p, taskc);
 
 	/*
@@ -1490,10 +1510,17 @@ void BPF_STRUCT_OPS(lavd_tick, struct task_struct *p)
 		u64 elapsed = time_delta(now, taskc->last_running_clk);
 		if (elapsed < taskc->tld_hint_slice_ns) {
 			u64 remaining = taskc->tld_hint_slice_ns - elapsed;
-			if (p->scx.slice != remaining)
+			if (p->scx.slice != remaining) {
+				debugln("tld_tick: pid=%d elapsed=%llu remaining=%llu old_slice=%llu",
+					p->pid, elapsed, remaining,
+					p->scx.slice);
 				p->scx.slice = remaining;
+			}
 		} else {
 			/* Hint budget exhausted, trigger reschedule */
+			debugln("tld_tick: pid=%d elapsed=%llu budget=%llu expired",
+				p->pid, elapsed,
+				taskc->tld_hint_slice_ns);
 			p->scx.slice = 0;
 		}
 	}
@@ -1893,7 +1920,7 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(lavd_init_task, struct task_struct *p,
 	} else {
 		for (i = 0; i < sizeof(*taskc) && can_loop; i++)
 			((char __arena *)taskc)[i] = 0;
-	
+
 		now = scx_bpf_now();
 		taskc->last_runnable_clk = now;
 		taskc->last_running_clk = now;
