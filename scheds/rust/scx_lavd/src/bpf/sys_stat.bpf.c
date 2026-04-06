@@ -367,8 +367,8 @@ static void collect_sys_stat(void)
 							   cpuc->cur_steal_util_invr);
 
 		ravg_accumulate(&cpuc->avg_irq_steal_ravg, cpuc->cur_steal_util_invr, c->now,
-					LAVD_RAVG_HALFLIFE_NS);
-		u64 avg_irq_fp = ravg_read(&cpuc->avg_irq_steal_ravg, c->now, LAVD_RAVG_HALFLIFE_NS);
+					LAVD_RAVG_HALFLIFE_NS, LAVD_SCALE);
+		u64 avg_irq_fp = ravg_read(&cpuc->avg_irq_steal_ravg, c->now, LAVD_RAVG_HALFLIFE_NS, LAVD_SCALE);
 		u32 avg_irq_val = (u32)(avg_irq_fp >> RAVG_FRAC_BITS);
 		cpuc->lat_headroom = (avg_irq_val < LAVD_SCALE) ? (LAVD_SCALE - avg_irq_val) : 0;
 

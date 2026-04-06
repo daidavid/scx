@@ -184,7 +184,7 @@ void dom_dcycle_adj(dom_ptr domc, u32 weight, u64 now, bool runnable)
 
 	bpf_spin_lock(&lockw->lock);
 	bucket->dcycle += adj;
-	ravg_accumulate(&bucket->rd, bucket->dcycle, now, load_half_life);
+	ravg_accumulate(&bucket->rd, bucket->dcycle, now, load_half_life, 1024);
 	bpf_spin_unlock(&lockw->lock);
 
 	if (adj < 0 && (s64)bucket->dcycle < 0)
@@ -196,7 +196,7 @@ void dom_dcycle_adj(dom_ptr domc, u32 weight, u64 now, bool runnable)
 	    (!domc->dbg_dcycle_printed_at || now - domc->dbg_dcycle_printed_at >= 1000000000)) {
 		bpf_printk("DCYCLE ADJ dom=%u bucket=%u adj=%lld dcycle=%u avg_dcycle=%llu",
 			   dom_id, bucket_idx, adj, bucket->dcycle,
-			   ravg_read(&bucket->rd, now, load_half_life) >> RAVG_FRAC_BITS);
+			   ravg_read(&bucket->rd, now, load_half_life, 1024) >> RAVG_FRAC_BITS);
 		domc->dbg_dcycle_printed_at = now;
 	}
 }
@@ -230,10 +230,10 @@ static int dom_dcycle_xfer_task(struct task_struct *p __arg_trusted, task_ptr ta
 	 * duty cycle from BPF. Load is computed in user space when performing
 	 * load balancing.
 	 */
-	ravg_accumulate(&task_dcyc_rd,  taskc->runnable, now, load_half_life);
+	ravg_accumulate(&task_dcyc_rd,  taskc->runnable, now, load_half_life, 1024);
 	taskc->dcyc_rd = taskc->dcyc_rd;
 	if (debug >= 2)
-		task_dcycle = ravg_read(&task_dcyc_rd, now, load_half_life);
+		task_dcycle = ravg_read(&task_dcyc_rd, now, load_half_life, 1024);
 
 	/* transfer out of @from_domc */
 	bpf_spin_lock(&from_lockw->lock);
@@ -241,13 +241,13 @@ static int dom_dcycle_xfer_task(struct task_struct *p __arg_trusted, task_ptr ta
 		from_bucket->dcycle--;
 
 	if (debug >= 2)
-		from_dcycle[0] = ravg_read(&from_bucket->rd, now, load_half_life);
+		from_dcycle[0] = ravg_read(&from_bucket->rd, now, load_half_life, 1024);
 
 	ravg_transfer(&from_bucket->rd, from_bucket->dcycle,
 		      &task_dcyc_rd, taskc->runnable, load_half_life, false);
 
 	if (debug >= 2)
-		from_dcycle[1] = ravg_read(&from_bucket->rd, now, load_half_life);
+		from_dcycle[1] = ravg_read(&from_bucket->rd, now, load_half_life, 1024);
 
 	bpf_spin_unlock(&from_lockw->lock);
 
@@ -257,13 +257,13 @@ static int dom_dcycle_xfer_task(struct task_struct *p __arg_trusted, task_ptr ta
 		to_bucket->dcycle++;
 
 	if (debug >= 2)
-		to_dcycle[0] = ravg_read(&to_bucket->rd, now, load_half_life);
+		to_dcycle[0] = ravg_read(&to_bucket->rd, now, load_half_life, 1024);
 
 	ravg_transfer(&to_bucket->rd, to_bucket->dcycle,
 		      &task_dcyc_rd, taskc->runnable, load_half_life, true);
 
 	if (debug >= 2)
-		to_dcycle[1] = ravg_read(&to_bucket->rd, now, load_half_life);
+		to_dcycle[1] = ravg_read(&to_bucket->rd, now, load_half_life, 1024);
 
 	bpf_spin_unlock(&to_lockw->lock);
 

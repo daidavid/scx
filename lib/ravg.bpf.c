@@ -31,12 +31,16 @@ static const int ravg_full_sum_len = sizeof(ravg_full_sum) / sizeof(ravg_full_su
  * @new_val: new value
  * @now: current timestamp
  * @half_life: decay period, must be the same across calls
+ * @scale: scaling factor [0, 1024] applied to the previous value's
+ *         contribution before folding it in. 1024 means full contribution
+ *         (unchanged behavior), 512 means half, 0 means discard. Only
+ *         matters when the previous value (rd->val) is non-zero.
  *
  * The current value is changing to @val at @now. Accumulate accordingly.
  */
 __weak
 int ravg_accumulate(struct ravg_data *rd, u64 new_val, u64 now,
-					  u32 half_life)
+					  u32 half_life, u32 scale)
 {
 	u32 cur_seq, val_seq, seq_delta;
 
@@ -80,6 +84,15 @@ int ravg_accumulate(struct ravg_data *rd, u64 new_val, u64 now,
 		goto out;
 
 	/*
+	 * Scale the previous value's contribution. 1024 means full (no
+	 * change), 512 means half, etc. Clamp to [0, 1024].
+	 */
+	u64 effective_val = rd->val;
+	if (scale < 1024) {
+		effective_val = (rd->val * (u64)scale) >> 10;
+	}
+
+	/*
 	 * Accumulate @rd->val between @rd->val_at and @now.
 	 *
 	 *                       @rd->val_at                        @now
@@ -92,7 +105,7 @@ int ravg_accumulate(struct ravg_data *rd, u64 new_val, u64 now,
 
 		/* fold the oldest period which may be partial */
 		dur = ravg_normalize_dur(half_life - rd->val_at % half_life, half_life);
-		ravg_add(&rd->old, rd->val * ravg_decay(dur, seq_delta));
+		ravg_add(&rd->old, effective_val * ravg_decay(dur, seq_delta));
 
 		/* fold the full periods in the middle with precomputed vals */
 		if (seq_delta > 1) {
@@ -101,14 +114,14 @@ int ravg_accumulate(struct ravg_data *rd, u64 new_val, u64 now,
 			if (idx >= ravg_full_sum_len)
 				idx = ravg_full_sum_len - 1;
 
-			ravg_add(&rd->old, rd->val * ravg_full_sum[idx]);
+			ravg_add(&rd->old, effective_val * ravg_full_sum[idx]);
 		}
 
 		/* accumulate the current period duration into ->cur */
-		rd->cur += rd->val * ravg_normalize_dur(now % half_life,
+		rd->cur += effective_val * ravg_normalize_dur(now % half_life,
 							half_life);
 	} else {
-		rd->cur += rd->val * ravg_normalize_dur(now - rd->val_at,
+		rd->cur += effective_val * ravg_normalize_dur(now - rd->val_at,
 							half_life);
 	}
 out:
@@ -190,11 +203,13 @@ int ravg_scale(struct ravg_data *rd, u32 mult, u32 rshift)
  * @rd: ravg_data to read from
  * @now: timestamp as of which to read the running avg
  * @half_life: decay period, must match ravg_accumulate()'s
+ * @scale: scaling factor [0, 1024] for the previous value's contribution,
+ *         must match ravg_accumulate()'s to get a consistent reading.
  *
  * Read running avg from @rd as of @now.
  */
 __weak
-u64 ravg_read(struct ravg_data *rd, u64 now, u64 half_life)
+u64 ravg_read(struct ravg_data *rd, u64 now, u64 half_life, u32 scale)
 {
 	struct ravg_data trd;
 	u32 elapsed;
@@ -219,7 +234,7 @@ u64 ravg_read(struct ravg_data *rd, u64 now, u64 half_life)
 	 */
 	trd = *rd;
 	rd = &trd;
-	ravg_accumulate(rd, 0, now, half_life);
+	ravg_accumulate(rd, 0, now, half_life, scale);
 
 	/*
 	 * At the beginning of a new half_life period, the running avg is the

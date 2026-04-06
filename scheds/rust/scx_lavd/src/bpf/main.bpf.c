@@ -389,7 +389,7 @@ static void update_stat_for_running(struct task_struct *p,
 	local_ravg.val_at = taskc->avg_util_ravg.val_at;
 	local_ravg.old = taskc->avg_util_ravg.old;
 	local_ravg.cur = taskc->avg_util_ravg.cur;
-	ravg_accumulate(&local_ravg, LAVD_SCALE, now, LAVD_RAVG_HALFLIFE_NS);
+	ravg_accumulate(&local_ravg, LAVD_SCALE, now, LAVD_RAVG_HALFLIFE_NS, LAVD_SCALE);
 	taskc->avg_util_ravg.val = local_ravg.val;
 	taskc->avg_util_ravg.val_at = local_ravg.val_at;
 	taskc->avg_util_ravg.old = local_ravg.old;
@@ -437,9 +437,9 @@ static void update_stat_for_running(struct task_struct *p,
 	 * Mark this CPU as busy in the duty-cycle ravg.
 	 */
 	ravg_accumulate(&cpuc->avg_util_ravg, LAVD_SCALE,
-			now, LAVD_RAVG_HALFLIFE_NS);
+			now, LAVD_RAVG_HALFLIFE_NS, LAVD_SCALE);
 	cpuc->util_est = (u32)(ravg_read(&cpuc->avg_util_ravg,
-				now, LAVD_RAVG_HALFLIFE_NS) >>
+				now, LAVD_RAVG_HALFLIFE_NS, LAVD_SCALE) >>
 				RAVG_FRAC_BITS);
 
 	/*
@@ -565,9 +565,9 @@ static void update_stat_for_stopping(struct task_struct *p,
 	 * Mark this CPU as idle in the duty-cycle ravg.
 	 */
 	ravg_accumulate(&cpuc->avg_util_ravg, 0, now,
-			LAVD_RAVG_HALFLIFE_NS);
+			LAVD_RAVG_HALFLIFE_NS, LAVD_SCALE);
 	cpuc->util_est = (u32)(ravg_read(&cpuc->avg_util_ravg, now,
-				  LAVD_RAVG_HALFLIFE_NS) >> RAVG_FRAC_BITS);
+				  LAVD_RAVG_HALFLIFE_NS, LAVD_SCALE) >> RAVG_FRAC_BITS);
 
 	/*
 	 * Account for how much of the slice was used for this instance.
@@ -1478,8 +1478,8 @@ void BPF_STRUCT_OPS(lavd_quiescent, struct task_struct *p, u64 deq_flags)
 	local_ravg.val_at = taskc->avg_util_ravg.val_at;
 	local_ravg.old = taskc->avg_util_ravg.old;
 	local_ravg.cur = taskc->avg_util_ravg.cur;
-	ravg_accumulate(&local_ravg, 0, now, LAVD_RAVG_HALFLIFE_NS);
-	u64 avg_util_fp = ravg_read(&local_ravg, now, LAVD_RAVG_HALFLIFE_NS);
+	ravg_accumulate(&local_ravg, 0, now, LAVD_RAVG_HALFLIFE_NS, LAVD_SCALE);
+	u64 avg_util_fp = ravg_read(&local_ravg, now, LAVD_RAVG_HALFLIFE_NS, LAVD_SCALE);
 	taskc->avg_util_ravg.val = local_ravg.val;
 	taskc->avg_util_ravg.val_at = local_ravg.val_at;
 	taskc->avg_util_ravg.old = local_ravg.old;

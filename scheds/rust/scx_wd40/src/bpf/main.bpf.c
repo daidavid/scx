@@ -101,7 +101,7 @@ static void task_load_adj(task_ptr taskc, u64 now, bool runnable)
 	rdp = taskc->dcyc_rd;
 
 	taskc->runnable = runnable;
-	ravg_accumulate(&rdp, taskc->runnable, now, load_half_life);
+	ravg_accumulate(&rdp, taskc->runnable, now, load_half_life, 1024);
 
 	taskc->dcyc_rd = rdp;
 }

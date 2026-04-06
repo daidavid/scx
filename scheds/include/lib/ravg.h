@@ -48,8 +48,9 @@ struct ravg_data {
 #define RAVG_FN_ATTRS __attribute__((unused, always_inline))
 
 int ravg_scale(struct ravg_data *rd, u32 mult, u32 rshift);
-u64 ravg_read(struct ravg_data *rd, u64 now, u64 half_life);
-int ravg_accumulate(struct ravg_data *rd, u64 new_val, u64 now, u32 half_life);
+u64 ravg_read(struct ravg_data *rd, u64 now, u64 half_life, u32 scale);
+int ravg_accumulate(struct ravg_data *rd, u64 new_val, u64 now, u32 half_life,
+		    u32 scale);
 
 static RAVG_FN_ATTRS void ravg_add(u64 *sum, u64 addend)
 {
@@ -101,9 +102,9 @@ static RAVG_FN_ATTRS void ravg_transfer(struct ravg_data *base, u64 base_new_val
 {
 	/* synchronize @base and @xfer */
 	if ((s64)(base->val_at - xfer->val_at) < 0)
-		ravg_accumulate(base, base_new_val, xfer->val_at, half_life);
+		ravg_accumulate(base, base_new_val, xfer->val_at, half_life, 1024);
 	else if ((s64)(base->val_at - xfer->val_at) > 0)
-		ravg_accumulate(xfer, xfer_new_val, base->val_at, half_life);
+		ravg_accumulate(xfer, xfer_new_val, base->val_at, half_life, 1024);
 
 	/* transfer */
 	if (is_xfer_in) {
