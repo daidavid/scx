@@ -552,6 +552,19 @@ static void update_stat_for_stopping(struct task_struct *p,
 	u64 now = scx_bpf_now();
 
 	/*
+	 * Using the pelt clock accounts for both CPU capacity/frequency
+	 * scaling and excludes IRQ/steal time, so delta_pelt / delta_wall
+	 * gives the true effective utilization over the period.
+	 * Must be done before account_task_runtime() updates the clocks.
+	 */
+	u64 delta_pelt = time_delta(scx_clock_pelt(cpuc->cpu_id),
+				    taskc->last_measured_pelt_clk);
+	u64 delta_wall = time_delta(now, taskc->last_measured_wall_clk);
+	u32 scale = LAVD_SCALE;
+	if (delta_wall > 0)
+		scale = min((u64)((delta_pelt * LAVD_SCALE) / delta_wall), (u64)LAVD_SCALE);
+
+	/*
 	 * Account task runtime statistics first.
 	 */
 	account_task_runtime(p, taskc, cpuc, now);
@@ -565,9 +578,9 @@ static void update_stat_for_stopping(struct task_struct *p,
 	 * Mark this CPU as idle in the duty-cycle ravg.
 	 */
 	ravg_accumulate(&cpuc->avg_util_ravg, 0, now,
-			LAVD_RAVG_HALFLIFE_NS, LAVD_SCALE);
+			LAVD_RAVG_HALFLIFE_NS, scale);
 	cpuc->util_est = (u32)(ravg_read(&cpuc->avg_util_ravg, now,
-				  LAVD_RAVG_HALFLIFE_NS, LAVD_SCALE) >> RAVG_FRAC_BITS);
+				  LAVD_RAVG_HALFLIFE_NS, scale) >> RAVG_FRAC_BITS);
 
 	/*
 	 * Account for how much of the slice was used for this instance.
