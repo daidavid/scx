@@ -19,6 +19,8 @@ extern const volatile bool	no_wake_sync;
 extern const volatile bool	no_slice_boost;
 extern const volatile bool	per_cpu_dsq;
 extern const volatile bool	enable_cpu_bw;
+extern const volatile bool	simple_enqueue;
+extern const volatile bool	smt_enabled;
 extern const volatile bool	is_autopilot_on;
 extern const volatile u8	verbose;
 
@@ -40,6 +42,7 @@ void set_affinity_flags(task_ctx __arg_arena *taskc,
 			const struct cpumask *cpumask);
 bool prob_x_out_of_y(u32 x, u32 y);
 u32 get_primary_cpu(u32 cpu);
+s32 get_sibling_cpu(u32 cpu);
 
 static inline bool rt_or_dl_task(struct task_struct *p)
 {

@@ -27,6 +27,11 @@ struct sticky_ctx {
 	struct cpu_ctx *cpuc_not_match[2];
 };
 
+static __always_inline bool is_smt_exclusive_task(struct pick_ctx *ctx)
+{
+	return smt_enabled && test_task_flag(ctx->taskc, LAVD_FLAG_SMT_EXCLUSIVE);
+}
+
 static __always_inline
 bool init_idle_i_mask(struct pick_ctx *ctx, const struct cpumask *idle_cpumask)
 {
@@ -841,6 +846,21 @@ s32 pick_idle_cpu(struct pick_ctx *ctx, bool *is_idle)
 			goto unlock_out;
 	}
 	/* NOTE: There is no fully idle CPU in the neighboring domain. */
+
+	/*
+	 * Best-effort SMT sibling exclusion. If the task explicitly asks
+	 * for an exclusive core and no fully idle core is available, stay
+	 * on the sticky CPU/domain rather than migrating onto a partially
+	 * idle SMT sibling.
+	 */
+	if (is_smt_exclusive_task(ctx)) {
+		cpu = sticky_cpu;
+		if (cpu == -ENOENT) {
+			cpu = find_sticky_cpu_at_cpdom(ctx, sticky_cpu,
+						       sticky_cpdom);
+		}
+		goto unlock_out;
+	}
 
 	/*
 	 * If there is an (partially) idle CPU in the sticky domain, stay on it.

@@ -202,11 +202,16 @@
 struct tld_keys {
 	tld_key_t slice_ms_key;
 	tld_key_t lat_cri_key;
+	tld_key_t smt_exclusive_key;
 };
 
-#define __COMPAT_lavd_refresh_tld_hints(p, taskc)			\
-	(bpf_core_field_exists(struct bpf_local_storage_elem, free_node) ? \
-	 __lavd_refresh_tld_hints((p), (taskc)) : (void)0)
+static void __lavd_refresh_tld_hints(struct task_struct *p, task_ctx *taskc);
+
+#define __COMPAT_lavd_refresh_tld_hints(p, taskc)				\
+	do {									\
+		if (bpf_core_field_exists(struct bpf_local_storage_elem, free_node)) \
+			__lavd_refresh_tld_hints((p), (taskc));			\
+	} while (0)
 
 char _license[] SEC("license") = "GPL";
 
@@ -266,6 +271,34 @@ static volatile u64	nr_cpus_big;
  */
 static pid_t		lavd_pid;
 
+static __always_inline void lavd_refresh_tld_hints(struct task_struct *p,
+						   task_ctx *taskc)
+{
+	if (!task_hint_map_enabled)
+		return;
+
+	__COMPAT_lavd_refresh_tld_hints(p, taskc);
+}
+
+static __always_inline bool sibling_cpu_running_smt_exclusive(s32 cpu)
+{
+	struct cpu_ctx *sib_cpuc;
+	s32 sib;
+
+	if (!smt_enabled || !is_smt_active)
+		return false;
+
+	sib = get_sibling_cpu(cpu);
+	if (sib < 0)
+		return false;
+
+	sib_cpuc = get_cpu_ctx_id(sib);
+	if (!sib_cpuc)
+		return false;
+
+	return test_cpu_flag(sib_cpuc, LAVD_FLAG_SMT_EXCLUSIVE);
+}
+
 static void advance_cur_logical_clk(struct task_struct *p)
 {
 	u64 vlc, clc, ret_clc;
@@ -307,12 +340,12 @@ static void __lavd_refresh_tld_hints(struct task_struct *p, task_ctx *taskc)
 	u64 *val;
 	int err;
 
-	if (!task_hint_map_enabled)
-		return;
-
 	err = tld_object_init(p, &tld_obj);
 	if (err) {
-		traceln("tld_init: pid=%d err=%d", p->pid, err);
+		taskc->tld_hint_slice_ns = 0;
+		taskc->tld_hint_lat_cri = 0;
+		taskc->tld_hint_smt_exclusive = 0;
+		reset_task_flag(taskc, LAVD_FLAG_SMT_EXCLUSIVE);
 		return;
 	}
 
@@ -340,6 +373,17 @@ static void __lavd_refresh_tld_hints(struct task_struct *p, task_ctx *taskc)
 		taskc->tld_hint_lat_cri = (u16)*val;
 	} else {
 		taskc->tld_hint_lat_cri = 0;
+	}
+
+	val = tld_get_data(&tld_obj, smt_exclusive_key, "smt_exclusive", sizeof(*val));
+	debugln("tld_read: pid=%d smt_exclusive val=%llx ptr=%llx",
+		p->pid, val ? *val : 0, (u64)val);
+	if (smt_enabled && val && *val > 0) {
+		taskc->tld_hint_smt_exclusive = 1;
+		set_task_flag(taskc, LAVD_FLAG_SMT_EXCLUSIVE);
+	} else {
+		taskc->tld_hint_smt_exclusive = 0;
+		reset_task_flag(taskc, LAVD_FLAG_SMT_EXCLUSIVE);
 	}
 }
 
@@ -703,6 +747,8 @@ s32 BPF_STRUCT_OPS(lavd_select_cpu, struct task_struct *p, s32 prev_cpu,
 	if (!ictx.taskc || !ictx.cpuc_cur)
 		return prev_cpu;
 
+	lavd_refresh_tld_hints(p, ictx.taskc);
+
 	/*
 	 * Check whether it is a synchronous wake-up to boost
 	 * latency-criticality later.
@@ -908,6 +954,13 @@ void BPF_STRUCT_OPS(lavd_enqueue, struct task_struct *p, u64 enq_flags)
 			__LINE__);
 	}
 
+	if (simple_enqueue) {
+		scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | cpu, p->scx.slice,
+				   enq_flags);
+		scx_bpf_kick_cpu(cpu, SCX_KICK_IDLE);
+		return;
+	}
+
 	/*
 	 * Enqueue the task to a DSQ. If it is safe to directly dispatch
 	 * to the local DSQ of the chosen CPU, do it. Otherwise, enqueue
@@ -1076,8 +1129,25 @@ void BPF_STRUCT_OPS(lavd_dispatch, s32 cpu, struct task_struct *prev)
 		return;
 	}
 
+	if (prev)
+		taskc_prev = get_task_ctx(prev);
+
+	if (is_smt_active &&
+	    sibling_cpu_running_smt_exclusive(cpu) &&
+	    (!taskc_prev || !test_task_flag(taskc_prev, LAVD_FLAG_SMT_EXCLUSIVE))) {
+		debugln("tld_smt_block: cpu=%d prev_pid=%d", cpu, prev ? prev->pid : -1);
+		return;
+	}
+
 	cpu_dsq_id = cpu_to_dsq(cpu);
 	cpdom_dsq_id = cpdom_to_dsq(cpuc->cpdom_id);
+
+	if (simple_enqueue) {
+		if (consume_task(cpu_dsq_id, cpdom_dsq_id))
+			return;
+		consume_prev(prev, taskc_prev, cpuc);
+		return;
+	}
 
 	/*
 	 * When the CPU bandwidth control is enabled, check if there are
@@ -1162,7 +1232,6 @@ void BPF_STRUCT_OPS(lavd_dispatch, s32 cpu, struct task_struct *prev)
 		 * If the previous task can run on this CPU but not on either
 		 * active or overflow set, extend the overflow set and go.
 		 */
-		taskc_prev = get_task_ctx(prev);
 		if (taskc_prev &&
 		    test_task_flag(taskc_prev, LAVD_FLAG_IS_AFFINITIZED) &&
 		    bpf_cpumask_test_cpu(cpu, prev->cpus_ptr) &&
@@ -1481,11 +1550,18 @@ void BPF_STRUCT_OPS(lavd_tick, struct task_struct *p)
 	/*
 	 * Refresh TLD hints.
 	 */
-	if (task_hint_map_enabled)
-		debugln("tld_compat: pid=%d compat=%d",
+	lavd_refresh_tld_hints(p, taskc);
+	if (test_cpu_flag(cpuc, LAVD_FLAG_SMT_EXCLUSIVE) !=
+	    test_task_flag(taskc, LAVD_FLAG_SMT_EXCLUSIVE)) {
+		debugln("tld_smt_apply: pid=%d cpu=%d smt_exclusive=%d",
 			p->pid,
-			bpf_core_field_exists(struct bpf_local_storage_elem, free_node));
-	__COMPAT_lavd_refresh_tld_hints(p, taskc);
+			cpuc->cpu_id,
+			test_task_flag(taskc, LAVD_FLAG_SMT_EXCLUSIVE) ? 1 : 0);
+	}
+	if (test_task_flag(taskc, LAVD_FLAG_SMT_EXCLUSIVE))
+		set_cpu_flag(cpuc, LAVD_FLAG_SMT_EXCLUSIVE);
+	else
+		reset_cpu_flag(cpuc, LAVD_FLAG_SMT_EXCLUSIVE);
 
 	/*
 	 * Under the CPU bandwidth control with cpu.max, check if the cgroup

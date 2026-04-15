@@ -28,6 +28,7 @@ use std::time::Duration;
 use anyhow::Context;
 use anyhow::Result;
 use clap::Parser;
+use clap::ValueEnum;
 use clap_num::number_range;
 use cpu_order::CpuOrder;
 use cpu_order::PerfCpuOrder;
@@ -68,6 +69,12 @@ use tracing::{debug, info, warn};
 use tracing_subscriber::filter::EnvFilter;
 
 const SCHEDULER_NAME: &str = "scx_lavd";
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
+enum SmtMode {
+    On,
+    Off,
+}
 /// scx_lavd: Latency-criticality Aware Virtual Deadline (LAVD) scheduler
 ///
 /// The rust part is minimal. It processes command line options and logs out
@@ -218,8 +225,23 @@ struct Opts {
     #[clap(long = "enable-cpu-bw", action = clap::ArgAction::SetTrue)]
     enable_cpu_bw: bool,
 
+    /// Use a minimal enqueue path that dispatches directly to the selected
+    /// local DSQ. This is intended for verifier-friendly validation.
+    #[clap(long = "simple-enqueue", action = clap::ArgAction::SetTrue)]
+    simple_enqueue: bool,
+
+    /// Disable execve tracepoints used for aggressive migration.
+    /// This is intended for verifier-friendly validation.
+    #[clap(long = "no-execve-migration-hooks", action = clap::ArgAction::SetTrue)]
+    no_execve_migration_hooks: bool,
+
+    /// Toggle best-effort SMT sibling exclusivity for SMT-tagged tasks.
+    #[clap(long = "smt", value_enum, default_value = "on")]
+    smt: SmtMode,
+
     /// Set the path for pinning the task hint map for TLD-based hints.
-    /// Enables userspace per-task hints (slice_ms, lat_cri) via task local data.
+    /// Enables userspace per-task hints (slice_ms, lat_cri, smt_exclusive)
+    /// via task local data.
     #[clap(long = "task-hint-map", default_value = "")]
     task_hint_map: String,
 
@@ -487,8 +509,13 @@ impl<'a> Scheduler<'a> {
 
         // When there are multiple domains, hook the execve() syscall family
         // to enable aggressive cross-domain migration when execve() is called.
-        if order.cpdom_map.len() > 1 {
+        if order.cpdom_map.len() > 1
+            && !opts.simple_enqueue
+            && !opts.no_execve_migration_hooks
+        {
             Self::attach_execve_tracepoints(&mut skel)?;
+        } else if order.cpdom_map.len() > 1 {
+            info!("Execve migration hooks are disabled.");
         }
 
         // Initialize skel according to @opts.
@@ -711,6 +738,8 @@ impl<'a> Scheduler<'a> {
         rodata.no_slice_boost = opts.no_slice_boost;
         rodata.per_cpu_dsq = opts.per_cpu_dsq;
         rodata.enable_cpu_bw = opts.enable_cpu_bw;
+        rodata.simple_enqueue = opts.simple_enqueue;
+        rodata.smt_enabled = matches!(opts.smt, SmtMode::On);
         rodata.task_hint_map_enabled = !opts.task_hint_map.is_empty();
 
         if !ksym_exists("scx_group_set_bandwidth").unwrap() {

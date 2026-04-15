@@ -339,9 +339,10 @@ static u64 calc_virtual_deadline_delta(struct task_struct *p,
 	 */
 	calc_lat_cri(p, taskc);
 
-	/* Override lat_cri with TLD hint if set */
-	if (taskc->tld_hint_lat_cri)
+	if (taskc->tld_hint_lat_cri) {
 		taskc->lat_cri = taskc->tld_hint_lat_cri;
+		taskc->normalized_lat_cri = normalize_lat_cri(taskc->lat_cri);
+	}
 
 	greedy_penalty = calc_greedy_penalty(p, taskc);
 	adjusted_runtime = calc_adjusted_runtime(taskc);

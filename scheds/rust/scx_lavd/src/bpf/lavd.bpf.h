@@ -139,8 +139,9 @@ enum consts_flags {
 	LAVD_FLAG_WOKEN_BY_RT_DL	= (0x1 << 11), /* woken by a RT/DL task */
 	LAVD_FLAG_WOKEN_BY_HARDIRQ	= (0x1 << 12), /* woken by a hardware interrupt */
 	LAVD_FLAG_WOKEN_BY_SOFTIRQ	= (0x1 << 13), /* woken by a softirq */
-	LAVD_FLAG_MIGRATION_AGGRESSIVE  = (0x1 << 14), /* immediate task migration is necessary. */
+	LAVD_FLAG_MIGRATION_AGGRESSIVE	= (0x1 << 14), /* immediate task migration is necessary. */
 	LAVD_FLAG_DOMAIN_PINNED		= (0x1 << 15), /* task's cpumask is confined to a single compute domain */
+	LAVD_FLAG_SMT_EXCLUSIVE		= (0x1 << 16), /* keep SMT sibling idle while running when possible */
 };
 
 #define LAVD_MASK_MIGRATION		(LAVD_FLAG_MIGRATION_AGGRESSIVE)
@@ -234,6 +235,7 @@ struct task_ctx {
 	char	waker_comm[TASK_COMM_LEN + 1]; /* last waker's comm */
 	u64	tld_hint_slice_ns;	/* TLD hint: target time slice in ns (0 = no hint) */
 	u16	tld_hint_lat_cri;	/* TLD hint: latency criticality override (0 = no hint) */
+	u8	tld_hint_smt_exclusive;	/* TLD hint: prefer an exclusive SMT core (0 = off) */
 } __attribute__((aligned(CACHELINE_SIZE)));
 
 /*
