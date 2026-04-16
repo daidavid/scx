@@ -262,6 +262,36 @@ static s32 pick_idle_cpu_at_cpdom(struct pick_ctx *ctx, s64 cpdom, u64 scope,
 }
 
 static __always_inline
+s32 pick_idle_cpu_anywhere(struct pick_ctx *ctx, u64 scope, bool *is_idle)
+{
+	s32 cpu;
+
+	if (!ctx->iat_empty) {
+		cpu = scx_bpf_pick_idle_cpu(cast_mask(ctx->iat_mask), scope);
+		if (cpu >= 0) {
+			*is_idle = true;
+			return cpu;
+		}
+	}
+	if (!ctx->ia_empty) {
+		cpu = scx_bpf_pick_idle_cpu(cast_mask(ctx->ia_mask), scope);
+		if (cpu >= 0) {
+			*is_idle = true;
+			return cpu;
+		}
+	}
+	if (!ctx->io_empty) {
+		cpu = scx_bpf_pick_idle_cpu(cast_mask(ctx->io_mask), scope);
+		if (cpu >= 0) {
+			*is_idle = true;
+			return cpu;
+		}
+	}
+
+	return -ENOENT;
+}
+
+static __always_inline
 s32 cpumask_any_dsitribute(struct pick_ctx *ctx)
 {
 	const struct cpumask *mask;
@@ -714,7 +744,7 @@ s32 pick_idle_cpu(struct pick_ctx *ctx, bool *is_idle)
 	 * masks so the idle CPU search prefers non-turbulent CPUs with
 	 * sufficient latency headroom.
 	 */
-	if (is_preemption_vulnerable(ctx)) {
+	if (is_preemption_vulnerable(ctx) || is_smt_exclusive_task(ctx)) {
 		if (!repartition_masks_for_latency(ctx))
 			goto err_out;
 	}
@@ -769,6 +799,20 @@ s32 pick_idle_cpu(struct pick_ctx *ctx, bool *is_idle)
 		cpu = sticky_cpu;
 		*is_idle = true;
 		goto unlock_out;
+	}
+
+	/*
+	 * Soft-partition SMT-exclusive work onto a colder core when one is
+	 * available anywhere in the eligible masks. This intentionally trades
+	 * some locality for lower contention: avoiding the sibling is useful,
+	 * but the larger win comes from escaping a hot sticky domain entirely.
+	 */
+	if (!i_smt_empty && is_smt_exclusive_task(ctx)) {
+		if (!init_idle_ato_masks(ctx, idle_smtmask))
+			goto err_out;
+		cpu = pick_idle_cpu_anywhere(ctx, SCX_PICK_IDLE_CORE, is_idle);
+		if (cpu >= 0)
+			goto unlock_out;
 	}
 
 	/*
