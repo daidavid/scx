@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# TL;DR: Short root wrapper that runs the main SMT-exclusive test with stable
+# artifact paths and the branch's default `lat-cri` hint mode.
 
 set -euo pipefail
 

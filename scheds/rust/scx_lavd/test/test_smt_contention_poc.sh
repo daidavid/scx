@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# TL;DR: Build and run the standalone SMT contention proof-of-concept to show
+# how much a busy sibling core slows the target thread on one CPU pair.
 
 set -euo pipefail
 

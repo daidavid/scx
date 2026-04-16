@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# TL;DR: End-to-end local SMT test that builds the helper worker, runs LAVD,
+# injects task-local hints, and asserts the exclusive task blocks its sibling.
 
 set -euo pipefail
 

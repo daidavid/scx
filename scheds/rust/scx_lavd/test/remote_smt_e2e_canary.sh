@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# TL;DR: Deploy a candidate LAVD build to one remote host, drive a first-flush-style
+# SMT-exclusive workload, and verify the host emits the expected scheduler signals.
 
 set -euo pipefail
 

@@ -1,4 +1,8 @@
 /* SPDX-License-Identifier: (LGPL-2.1 OR BSD-2-Clause) */
+/*
+ * TL;DR: Small userspace helper header for mapping and updating the scheduler's
+ * task-local hint page from the branch test binaries.
+ */
 #ifndef __SCX_LAVD_TASK_LOCAL_DATA_USER_H
 #define __SCX_LAVD_TASK_LOCAL_DATA_USER_H
 

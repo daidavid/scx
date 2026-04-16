@@ -1,4 +1,8 @@
 #define _GNU_SOURCE
+/*
+ * TL;DR: Minimal pinned spin worker used to prove that sharing an SMT sibling
+ * measurably slows a latency-sensitive thread on the selected CPU pair.
+ */
 
 #include <errno.h>
 #include <sched.h>

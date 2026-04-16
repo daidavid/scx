@@ -1,4 +1,8 @@
 #define _GNU_SOURCE
+/*
+ * TL;DR: Userspace worker that writes task-local hint values and generates the
+ * paired exclusive/peer workload used by the LAVD SMT tests.
+ */
 
 #include <errno.h>
 #include <linux/sched.h>
