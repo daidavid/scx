@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+SELF="$(readlink -f "${BASH_SOURCE[0]}")"
+DIR="$(cd "$(dirname "$SELF")" && pwd)"
+
+if [[ $EUID -ne 0 ]]; then
+  exec sudo -n "$0" "$@"
+fi
+
+mkdir -p "$DIR/artifacts"
+
+exec env \
+  KEEP_TMP=1 \
+  TMP_DIR="${TMP_DIR:-$DIR/artifacts}" \
+  SCX_LAVD_BIN="${SCX_LAVD_BIN:-/root/scx_lavd}" \
+  MAP_PATH="${MAP_PATH:-/run/wds/shared_bpf/scx_tld_hint_map}" \
+  SMT_HINT_MODE="${SMT_HINT_MODE:-lat-cri}" \
+  "$DIR/test_smt_exclusive.sh" "$@"

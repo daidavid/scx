@@ -848,21 +848,6 @@ s32 pick_idle_cpu(struct pick_ctx *ctx, bool *is_idle)
 	/* NOTE: There is no fully idle CPU in the neighboring domain. */
 
 	/*
-	 * Best-effort SMT sibling exclusion. If the task explicitly asks
-	 * for an exclusive core and no fully idle core is available, stay
-	 * on the sticky CPU/domain rather than migrating onto a partially
-	 * idle SMT sibling.
-	 */
-	if (is_smt_exclusive_task(ctx)) {
-		cpu = sticky_cpu;
-		if (cpu == -ENOENT) {
-			cpu = find_sticky_cpu_at_cpdom(ctx, sticky_cpu,
-						       sticky_cpdom);
-		}
-		goto unlock_out;
-	}
-
-	/*
 	 * If there is an (partially) idle CPU in the sticky domain, stay on it.
 	 * In the domain, search in the order of turbo, active, and overflow.
 	 */

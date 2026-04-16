@@ -209,7 +209,8 @@ static void __lavd_refresh_tld_hints(struct task_struct *p, task_ctx *taskc);
 
 #define __COMPAT_lavd_refresh_tld_hints(p, taskc)				\
 	do {									\
-		if (bpf_core_field_exists(struct bpf_local_storage_elem, free_node)) \
+		if (bpf_core_field_exists(struct bpf_local_storage_elem, snode) || \
+		    bpf_core_field_exists(struct bpf_local_storage_elem, free_node)) \
 			__lavd_refresh_tld_hints((p), (taskc));			\
 	} while (0)
 
@@ -299,6 +300,135 @@ static __always_inline bool sibling_cpu_running_smt_exclusive(s32 cpu)
 	return test_cpu_flag(sib_cpuc, LAVD_FLAG_SMT_EXCLUSIVE);
 }
 
+enum {
+	TLD_HINT_SLICE_MS_OFF = 0,
+	TLD_HINT_LAT_CRI_OFF = sizeof(u64),
+	TLD_HINT_SMT_EXCLUSIVE_OFF = 2 * sizeof(u64),
+};
+
+/*
+ * Temporary branch-local fallback: treat first-flush lat_cri hints at or above
+ * 16000 as implicitly SMT-exclusive even when userspace hasn't propagated the
+ * third TLD bit yet.
+ *
+ * The confusing live observation on the current IG codepath is that feed first
+ * flush requests are reaching LAVD with slice_ms=14 and lat_cri=16000 while
+ * smt_exclusive remains 0, even though no matching fbsource canary was rolled
+ * for this experiment. This fallback exists only to test that mismatch quickly
+ * from the custom LAVD branch.
+ *
+ * The live data so far shows sibling blocking is real, but the e2e latency win
+ * is still much smaller than expected. The next branch-local experiment is to
+ * treat SMT-exclusive first-flush tasks as much more latency-critical inside
+ * LAVD so they win deadlines and preemption more decisively, not just SMT
+ * sibling isolation.
+ *
+ * Do not treat this behavior, or anything else in this custom branch / local
+ * commit stack, as committed or deployed production behavior until it lands via
+ * the normal production path.
+ */
+#define TLD_HINT_SMT_LAT_CRI_THRESHOLD 16000
+#define TLD_HINT_SMT_EFFECTIVE_LAT_CRI 60000
+
+static __always_inline bool tld_hint_requests_smt_exclusive(task_ctx *taskc, u64 smt_val)
+{
+	if (!smt_enabled)
+		return false;
+
+	if (smt_val > 0)
+		return true;
+
+	return taskc->tld_hint_lat_cri >= TLD_HINT_SMT_LAT_CRI_THRESHOLD;
+}
+
+static __always_inline void apply_smt_exclusive_hint(struct task_struct *p, task_ctx *taskc,
+						     u64 smt_val)
+{
+	if (tld_hint_requests_smt_exclusive(taskc, smt_val)) {
+		if (smt_val == 0 &&
+		    taskc->tld_hint_lat_cri >= TLD_HINT_SMT_LAT_CRI_THRESHOLD)
+			debugln("tld_hint: pid=%d smt_fallback lat_cri=%llu", p->pid,
+				taskc->tld_hint_lat_cri);
+		if (taskc->tld_hint_lat_cri < TLD_HINT_SMT_EFFECTIVE_LAT_CRI) {
+			debugln("tld_hint: pid=%d smt_lat_boost lat_cri=%llu boosted=%u",
+				p->pid, taskc->tld_hint_lat_cri,
+				TLD_HINT_SMT_EFFECTIVE_LAT_CRI);
+			taskc->tld_hint_lat_cri = TLD_HINT_SMT_EFFECTIVE_LAT_CRI;
+		}
+		taskc->tld_hint_smt_exclusive = 1;
+		set_task_flag(taskc, LAVD_FLAG_SMT_EXCLUSIVE);
+	} else {
+		taskc->tld_hint_smt_exclusive = 0;
+		reset_task_flag(taskc, LAVD_FLAG_SMT_EXCLUSIVE);
+	}
+}
+
+static __always_inline bool tld_read_u64_fixed_off(struct task_struct *p, u32 off, u64 *out)
+{
+	struct tld_map_value *mapv;
+	u32 start;
+	u64 addr;
+
+	mapv = bpf_task_storage_get(&tld_data_map, p, 0, 0);
+	if (!mapv || !mapv->data)
+		return false;
+
+	start = mapv->start;
+	if (start > (__PAGE_SIZE - sizeof(*out)))
+		return false;
+	if (off > (__PAGE_SIZE - start - sizeof(*out)))
+		return false;
+
+	addr = (u64)mapv->data + start + off;
+	if (bpf_probe_read_user(out, sizeof(*out), (const void *)addr))
+		return false;
+
+	return true;
+}
+
+static __always_inline void lavd_refresh_tld_hints_verifier_friendly(struct task_struct *p,
+								     task_ctx *taskc)
+{
+	u64 val_u64 = 0;
+
+	if (!tld_read_u64_fixed_off(p, TLD_HINT_SLICE_MS_OFF, &val_u64))
+		val_u64 = 0;
+	debugln("tld_read: pid=%d slice_ms val=%llx off=%u", p->pid, val_u64,
+		TLD_HINT_SLICE_MS_OFF);
+	if (val_u64 > 0)
+		taskc->tld_hint_slice_ns = val_u64 * NSEC_PER_MSEC;
+	else
+		taskc->tld_hint_slice_ns = 0;
+
+	val_u64 = 0;
+	if (!tld_read_u64_fixed_off(p, TLD_HINT_LAT_CRI_OFF, &val_u64))
+		val_u64 = 0;
+	debugln("tld_read: pid=%d lat_cri val=%llx off=%u", p->pid, val_u64,
+		TLD_HINT_LAT_CRI_OFF);
+	if (val_u64 > 0)
+		taskc->tld_hint_lat_cri = (u16)val_u64;
+	else
+		taskc->tld_hint_lat_cri = 0;
+
+	val_u64 = 0;
+	if (!tld_read_u64_fixed_off(p, TLD_HINT_SMT_EXCLUSIVE_OFF, &val_u64))
+		val_u64 = 0;
+	debugln("tld_read: pid=%d smt_exclusive val=%llx off=%u", p->pid, val_u64,
+		TLD_HINT_SMT_EXCLUSIVE_OFF);
+	apply_smt_exclusive_hint(p, taskc, val_u64);
+}
+
+static __always_inline void lavd_refresh_tld_hints_placement(struct task_struct *p,
+							      task_ctx *taskc)
+{
+	/*
+	 * Wakeup placement is verifier-sensitive on this host. Use the
+	 * fixed-offset reader here so select_cpu/enqueue can see fresh hints
+	 * without pulling in the heavier name lookup path.
+	 */
+	lavd_refresh_tld_hints_verifier_friendly(p, taskc);
+}
+
 static void advance_cur_logical_clk(struct task_struct *p)
 {
 	u64 vlc, clc, ret_clc;
@@ -338,7 +468,13 @@ static void __lavd_refresh_tld_hints(struct task_struct *p, task_ctx *taskc)
 {
 	struct tld_object tld_obj;
 	u64 *val;
+	u64 val_u64;
 	int err;
+
+	if (simple_enqueue) {
+		lavd_refresh_tld_hints_verifier_friendly(p, taskc);
+		return;
+	}
 
 	err = tld_object_init(p, &tld_obj);
 	if (err) {
@@ -348,43 +484,39 @@ static void __lavd_refresh_tld_hints(struct task_struct *p, task_ctx *taskc)
 		reset_task_flag(taskc, LAVD_FLAG_SMT_EXCLUSIVE);
 		return;
 	}
-
 	debugln("tld_read: pid=%d tld_obj_init ok", p->pid);
 
 	/* Read slice_ms hint */
 	val = tld_get_data(&tld_obj, slice_ms_key, "slice_ms", sizeof(*val));
+	val_u64 = val ? *val : 0;
 	debugln("tld_read: pid=%d slice_ms val=%llx ptr=%llx",
-		p->pid, val ? *val : 0, (u64)val);
-	if (val && *val > 0) {
+		p->pid, val_u64, (u64)val);
+	if (val && val_u64 > 0) {
 		if (!taskc->tld_hint_slice_ns)
-			debugln("tld_hint: pid=%d slice_ms=%llu", p->pid, *val);
-		taskc->tld_hint_slice_ns = *val * NSEC_PER_MSEC;
+			debugln("tld_hint: pid=%d slice_ms=%llu", p->pid, val_u64);
+		taskc->tld_hint_slice_ns = val_u64 * NSEC_PER_MSEC;
 	} else {
 		taskc->tld_hint_slice_ns = 0;
 	}
 
 	/* Read lat_cri hint */
 	val = tld_get_data(&tld_obj, lat_cri_key, "lat_cri", sizeof(*val));
+	val_u64 = val ? *val : 0;
 	debugln("tld_read: pid=%d lat_cri val=%llx ptr=%llx",
-		p->pid, val ? *val : 0, (u64)val);
-	if (val && *val > 0) {
+		p->pid, val_u64, (u64)val);
+	if (val && val_u64 > 0) {
 		if (!taskc->tld_hint_lat_cri)
-			debugln("tld_hint: pid=%d lat_cri=%llu", p->pid, *val);
-		taskc->tld_hint_lat_cri = (u16)*val;
+			debugln("tld_hint: pid=%d lat_cri=%llu", p->pid, val_u64);
+		taskc->tld_hint_lat_cri = (u16)val_u64;
 	} else {
 		taskc->tld_hint_lat_cri = 0;
 	}
 
 	val = tld_get_data(&tld_obj, smt_exclusive_key, "smt_exclusive", sizeof(*val));
+	val_u64 = val ? *val : 0;
 	debugln("tld_read: pid=%d smt_exclusive val=%llx ptr=%llx",
-		p->pid, val ? *val : 0, (u64)val);
-	if (smt_enabled && val && *val > 0) {
-		taskc->tld_hint_smt_exclusive = 1;
-		set_task_flag(taskc, LAVD_FLAG_SMT_EXCLUSIVE);
-	} else {
-		taskc->tld_hint_smt_exclusive = 0;
-		reset_task_flag(taskc, LAVD_FLAG_SMT_EXCLUSIVE);
-	}
+		p->pid, val_u64, (u64)val);
+	apply_smt_exclusive_hint(p, taskc, val ? val_u64 : 0);
 }
 
 static u64 calc_time_slice(task_ctx *taskc, struct cpu_ctx *cpuc)
@@ -747,7 +879,12 @@ s32 BPF_STRUCT_OPS(lavd_select_cpu, struct task_struct *p, s32 prev_cpu,
 	if (!ictx.taskc || !ictx.cpuc_cur)
 		return prev_cpu;
 
-	lavd_refresh_tld_hints(p, ictx.taskc);
+	/*
+	 * Refresh TLD hints before placement so wakeup-time CPU choice,
+	 * slice selection, and latency criticality all see the current
+	 * first-flush hint state.
+	 */
+	lavd_refresh_tld_hints_placement(p, ictx.taskc);
 
 	/*
 	 * Check whether it is a synchronous wake-up to boost
@@ -969,7 +1106,21 @@ void BPF_STRUCT_OPS(lavd_enqueue, struct task_struct *p, u64 enq_flags)
 	 * When pinned_slice_ns is enabled, pinned tasks always use per-CPU DSQ
 	 * to enable vtime comparison across DSQs during dispatch.
 	 */
-	if (can_direct_dispatch(cpuc, is_idle)) {
+	if (test_task_flag(taskc, LAVD_FLAG_SMT_EXCLUSIVE)) {
+		/*
+		 * First-flush SMT-exclusive work is latency-sensitive enough that
+		 * it should not wait behind normal DSQ ordering after we already
+		 * picked a target CPU for it. Insert it directly on the chosen
+		 * CPU and kick that CPU so it competes immediately.
+		 */
+		scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | cpu, p->scx.slice,
+				   enq_flags);
+		if (is_idle)
+			scx_bpf_kick_cpu(cpu, SCX_KICK_IDLE);
+		else if (!no_preemption)
+			scx_bpf_kick_cpu(cpu, SCX_KICK_PREEMPT);
+		return;
+	} else if (can_direct_dispatch(cpuc, is_idle)) {
 		scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | cpu, p->scx.slice,
 				   enq_flags);
 	} else {
@@ -1011,6 +1162,12 @@ int enqueue_cb(struct task_struct __arg_trusted *p, task_ctx *taskc)
 		scx_bpf_error("Failed to lookup a task context: %d", p->pid);
 		return 0;
 	}
+
+	/*
+	 * Refresh hints on enqueue too so re-enqueues and non-select_cpu
+	 * paths still see up-to-date TLD state.
+	 */
+	lavd_refresh_tld_hints_placement(p, taskc);
 
 	/*
 	 * Calculate when a task can be scheduled.
@@ -1129,18 +1286,30 @@ void BPF_STRUCT_OPS(lavd_dispatch, s32 cpu, struct task_struct *prev)
 		return;
 	}
 
+	cpu_dsq_id = cpu_to_dsq(cpu);
+	cpdom_dsq_id = cpdom_to_dsq(cpuc->cpdom_id);
+
 	if (prev)
 		taskc_prev = get_task_ctx(prev);
 
 	if (is_smt_active &&
 	    sibling_cpu_running_smt_exclusive(cpu) &&
-	    (!taskc_prev || !test_task_flag(taskc_prev, LAVD_FLAG_SMT_EXCLUSIVE))) {
-		debugln("tld_smt_block: cpu=%d prev_pid=%d", cpu, prev ? prev->pid : -1);
+	    /*
+	     * Keep SMT exclusivity anchored to one logical CPU per core pair.
+	     *
+	     * The previous soft block only rejected non-exclusive sibling work.
+	     * That still allowed two first-flush tasks to keep occupying both
+	     * siblings of a core once they got there, which weakens the expected
+	     * latency win. Prefer the primary logical CPU for the reserved slot
+	     * and make the secondary sibling yield even if it is also carrying an
+	     * SMT-exclusive task.
+	     */
+	    ((cpu != get_primary_cpu(cpu)) ||
+	     !taskc_prev || !test_task_flag(taskc_prev, LAVD_FLAG_SMT_EXCLUSIVE))) {
+		bpf_printk("tld_smt_block: cpu=%d prev_pid=%d",
+			   cpu, prev ? prev->pid : -1);
 		return;
 	}
-
-	cpu_dsq_id = cpu_to_dsq(cpu);
-	cpdom_dsq_id = cpdom_to_dsq(cpuc->cpdom_id);
 
 	if (simple_enqueue) {
 		if (consume_task(cpu_dsq_id, cpdom_dsq_id))
@@ -1486,6 +1655,27 @@ void BPF_STRUCT_OPS(lavd_running, struct task_struct *p)
 		return;
 	}
 
+	lavd_refresh_tld_hints(p, taskc);
+	if (smt_enabled && is_smt_active &&
+	    test_task_flag(taskc, LAVD_FLAG_SMT_EXCLUSIVE)) {
+		struct cpu_ctx *prev_cpuc;
+		s32 sib;
+		u32 prev_cpu = taskc->cpu_id;
+
+		if (prev_cpu < nr_cpu_ids && prev_cpu != cpuc->cpu_id) {
+			prev_cpuc = get_cpu_ctx_id(prev_cpu);
+			if (prev_cpuc && test_cpu_flag(prev_cpuc, LAVD_FLAG_SMT_EXCLUSIVE))
+				reset_cpu_flag(prev_cpuc, LAVD_FLAG_SMT_EXCLUSIVE);
+		}
+
+		if (!test_cpu_flag(cpuc, LAVD_FLAG_SMT_EXCLUSIVE)) {
+			set_cpu_flag(cpuc, LAVD_FLAG_SMT_EXCLUSIVE);
+			sib = get_sibling_cpu(cpuc->cpu_id);
+			if (sib >= 0 && sib != cpuc->cpu_id)
+				scx_bpf_kick_cpu(sib, SCX_KICK_PREEMPT);
+		}
+	}
+
 	/*
 	 * If the sched_ext core directly dispatched a task, calculating the
 	 * task's deadline and time slice was also skipped. In this case, we
@@ -1551,13 +1741,6 @@ void BPF_STRUCT_OPS(lavd_tick, struct task_struct *p)
 	 * Refresh TLD hints.
 	 */
 	lavd_refresh_tld_hints(p, taskc);
-	if (test_cpu_flag(cpuc, LAVD_FLAG_SMT_EXCLUSIVE) !=
-	    test_task_flag(taskc, LAVD_FLAG_SMT_EXCLUSIVE)) {
-		debugln("tld_smt_apply: pid=%d cpu=%d smt_exclusive=%d",
-			p->pid,
-			cpuc->cpu_id,
-			test_task_flag(taskc, LAVD_FLAG_SMT_EXCLUSIVE) ? 1 : 0);
-	}
 	if (test_task_flag(taskc, LAVD_FLAG_SMT_EXCLUSIVE))
 		set_cpu_flag(cpuc, LAVD_FLAG_SMT_EXCLUSIVE);
 	else
@@ -2006,6 +2189,8 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(lavd_init_task, struct task_struct *p,
 		taskc->svc_time_iwgt = sys_stat.avg_svc_time_iwgt;
 	}
 
+	taskc->cpu_id = -ENOENT;
+	taskc->prev_cpu_id = -ENOENT;
 	taskc->pinned_cpu_id = -ENOENT;
 	taskc->pid = p->pid;
 	taskc->cgrp_id = args->cgroup->kn->id;

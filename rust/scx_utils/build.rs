@@ -7,8 +7,61 @@ use std::env;
 use std::fs::File;
 use std::io::{Read, Seek};
 use std::path::PathBuf;
+use std::process::Command;
 
 use scx_cargo::ClangInfo;
+
+fn emit_git_build_id() {
+    let manifest_dir = env::var("CARGO_MANIFEST_DIR").unwrap();
+    let repo_root = Command::new("git")
+        .args(["-C", &manifest_dir, "rev-parse", "--show-toplevel"])
+        .output()
+        .ok()
+        .filter(|out| out.status.success())
+        .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string());
+
+    let Some(repo_root) = repo_root else {
+        return;
+    };
+
+    let git_dir = Command::new("git")
+        .args(["-C", &repo_root, "rev-parse", "--git-dir"])
+        .output()
+        .ok()
+        .filter(|out| out.status.success())
+        .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string());
+
+    if let Some(git_dir) = git_dir {
+        let git_dir = if PathBuf::from(&git_dir).is_absolute() {
+            PathBuf::from(git_dir)
+        } else {
+            PathBuf::from(&repo_root).join(git_dir)
+        };
+        println!("cargo:rerun-if-changed={}", git_dir.join("HEAD").display());
+        println!("cargo:rerun-if-changed={}", git_dir.join("index").display());
+    }
+
+    let sha = Command::new("git")
+        .args(["-C", &repo_root, "rev-parse", "--short", "HEAD"])
+        .output()
+        .ok()
+        .filter(|out| out.status.success())
+        .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string());
+    if let Some(sha) = sha {
+        println!("cargo:rustc-env=SCX_GIT_SHA={sha}");
+    }
+
+    let dirty = Command::new("git")
+        .args(["-C", &repo_root, "status", "--porcelain"])
+        .output()
+        .ok()
+        .filter(|out| out.status.success())
+        .map(|out| !out.stdout.is_empty())
+        .unwrap_or(false);
+    if dirty {
+        println!("cargo:rustc-env=SCX_GIT_DIRTY=1");
+    }
+}
 
 fn gen_bindings() {
     let out_dir = env::var("OUT_DIR").unwrap();
@@ -63,6 +116,7 @@ fn gen_bindings() {
 
 fn main() {
     gen_bindings();
+    emit_git_build_id();
 
     // Emit the target triple so build_id.rs can read it without vergen.
     // This is stable across commits so it won't invalidate the cache.
