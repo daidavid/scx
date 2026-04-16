@@ -44,6 +44,8 @@ const volatile bool	no_wake_sync;
 const volatile bool	no_slice_boost;
 const volatile bool	per_cpu_dsq;
 const volatile bool	enable_cpu_bw;
+const volatile bool	simple_enqueue;
+const volatile bool	smt_enabled;
 const volatile bool	is_autopilot_on;
 const volatile u8	verbose;
 
@@ -365,6 +367,23 @@ u32 __attribute__ ((noinline)) get_primary_cpu(u32 cpu) {
 	}
 
 	return ((cpu < *sibling) ? cpu : *sibling);
+}
+
+__hidden
+s32 __attribute__ ((noinline)) get_sibling_cpu(u32 cpu)
+{
+	const volatile u32 *sibling;
+
+	if (!is_smt_active)
+		return -ENOENT;
+
+	sibling = MEMBER_VPTR(cpu_sibling, [cpu]);
+	if (!sibling) {
+		debugln("Infeasible CPU id: %d", cpu);
+		return -ENOENT;
+	}
+
+	return *sibling;
 }
 
 __hidden

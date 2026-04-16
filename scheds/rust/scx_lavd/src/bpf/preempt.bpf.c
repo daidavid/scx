@@ -453,4 +453,3 @@ void reset_cpu_preemption_info(struct cpu_ctx *cpuc, bool released)
 		cpuc->est_stopping_clk = SCX_SLICE_INF;
 	}
 }
-

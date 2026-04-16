@@ -164,9 +164,10 @@ static int tld_object_init(struct task_struct *task, struct tld_object *tld_obj)
 }
 
 /*
- * Return the offset of TLD if @name is found. Otherwise, return the current TLD count
- * using the nonpositive range so that the next tld_get_data() can skip fetching key if
- * no new TLD is added or start comparing name from the first newly added TLD.
+ * Return the offset of TLD plus one if @name is found. Otherwise, return the current
+ * TLD count encoded as -(cnt + 1) so that 0 stays reserved for an uncached key and the
+ * next tld_get_data() can skip fetching key if no new TLD is added or start comparing
+ * name from the first newly added TLD.
  */
 __attribute__((unused))
 static int __tld_fetch_key(struct tld_object *tld_obj, const char *name, int i_start)
@@ -186,12 +187,12 @@ static int __tld_fetch_key(struct tld_object *tld_obj, const char *name, int i_s
 			break;
 
 		if (i >= i_start && !bpf_strncmp(metadata[i].name, TLD_NAME_LEN, name))
-			return start + off;
+			return start + off + 1;
 
 		off += TLD_ROUND_UP(metadata[i].size, 8);
 	}
 
-	return -cnt;
+	return -(cnt + 1);
 }
 
 /**
@@ -214,21 +215,23 @@ static int __tld_fetch_key(struct tld_object *tld_obj, const char *name, int i_s
 											\
 		if (likely(_data)) {							\
 			if (likely(off > 0)) {						\
+				off--;							\
 				barrier_var(off);					\
 				if (likely(off < __PAGE_SIZE - size))			\
 					data = _data + off;				\
 			} else {							\
-				cnt = -(off);						\
+				cnt = off < 0 ? -(off + 1) : 0;				\
 				if (likely((tld_obj)->data_map->meta) &&		\
 				    cnt < (tld_obj)->data_map->meta->cnt) {		\
 					off = __tld_fetch_key(tld_obj, name, cnt);	\
 					(tld_obj)->key_map->key.off = off;		\
 											\
-					if (likely(off < __PAGE_SIZE - size)) {		\
+					if (likely(off > 0)) {				\
+						off--;					\
 						barrier_var(off);			\
-						if (off > 0)				\
-							data = _data + off;		\
-					}						\
+						if (likely(off < __PAGE_SIZE - size))	\
+							data = _data + off;	\
+					}							\
 				}							\
 			}								\
 		}									\
