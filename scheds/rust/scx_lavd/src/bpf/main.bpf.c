@@ -329,6 +329,8 @@ enum {
  */
 #define TLD_HINT_SMT_LAT_CRI_THRESHOLD 16000
 #define TLD_HINT_SMT_SHORT_SLICE_LAT_CRI_THRESHOLD 8000
+#define TLD_HINT_SMT_TINY_SLICE_LAT_CRI_THRESHOLD 128
+#define TLD_HINT_SMT_TINY_SLICE_NS (5 * NSEC_PER_MSEC)
 #define TLD_HINT_SMT_SHORT_SLICE_NS (10 * NSEC_PER_MSEC)
 #define TLD_HINT_SMT_EFFECTIVE_LAT_CRI 60000
 #define TLD_HINT_SMT_CORE_RESERVE_NS (8 * NSEC_PER_MSEC)
@@ -365,6 +367,11 @@ static __always_inline bool tld_hint_requests_smt_exclusive(struct task_struct *
 	if (taskc->tld_hint_lat_cri >= TLD_HINT_SMT_LAT_CRI_THRESHOLD)
 		return true;
 
+	if (taskc->tld_hint_slice_ns > 0 &&
+	    taskc->tld_hint_slice_ns <= TLD_HINT_SMT_TINY_SLICE_NS &&
+	    taskc->tld_hint_lat_cri >= TLD_HINT_SMT_TINY_SLICE_LAT_CRI_THRESHOLD)
+		return true;
+
 	return taskc->tld_hint_slice_ns > 0 &&
 	       taskc->tld_hint_slice_ns <= TLD_HINT_SMT_SHORT_SLICE_NS &&
 	       taskc->tld_hint_lat_cri >= TLD_HINT_SMT_SHORT_SLICE_LAT_CRI_THRESHOLD;
@@ -375,7 +382,7 @@ static __always_inline void apply_smt_exclusive_hint(struct task_struct *p, task
 {
 	if (tld_hint_requests_smt_exclusive(p, taskc, smt_val)) {
 		if (smt_val == 0 &&
-		    taskc->tld_hint_lat_cri >= TLD_HINT_SMT_SHORT_SLICE_LAT_CRI_THRESHOLD)
+		    taskc->tld_hint_lat_cri >= TLD_HINT_SMT_TINY_SLICE_LAT_CRI_THRESHOLD)
 			debugln("tld_hint: pid=%d smt_fallback lat_cri=%llu slice_ns=%llu",
 				p->pid, taskc->tld_hint_lat_cri, taskc->tld_hint_slice_ns);
 		if (taskc->tld_hint_lat_cri < TLD_HINT_SMT_EFFECTIVE_LAT_CRI) {
