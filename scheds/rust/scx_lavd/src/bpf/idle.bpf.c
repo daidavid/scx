@@ -816,6 +816,17 @@ s32 pick_idle_cpu(struct pick_ctx *ctx, bool *is_idle)
 	}
 
 	/*
+	 * If there is no fully idle core to escape to, still bias
+	 * SMT-exclusive work toward a colder eligible CPU instead of
+	 * immediately collapsing back to sticky locality.
+	 */
+	if (is_smt_exclusive_task(ctx)) {
+		cpu = pick_random_cpu(ctx);
+		if (cpu >= 0)
+			goto unlock_out;
+	}
+
+	/*
 	 * If SMT is enabled and there is a fully idle CPU
 	 * in the sticky domain, stay on it.
 	 */
