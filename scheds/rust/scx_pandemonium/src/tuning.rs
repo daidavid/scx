@@ -37,13 +37,6 @@ const LIGHT_P99_CEIL_NS: u64 = 3_000_000; // 3MS
 const MIXED_P99_CEIL_NS: u64 = 5_000_000; // 5MS: BELOW 16MS FRAME BUDGET
 const HEAVY_P99_CEIL_NS: u64 = 10_000_000; // 10MS: HEAVY LOAD, REALISTIC
 
-// CPU-BOUND DEMOTION THRESHOLDS
-// PER-REGIME: LENIENT IN LIGHT, AGGRESSIVE IN HEAVY
-
-pub const LIGHT_DEMOTION_NS: u64 = 3_500_000; // 3.5MS: LENIENT, FEW CONTEND
-pub const MIXED_DEMOTION_NS: u64 = 2_500_000; // 2.5MS: CURRENT CPU_BOUND_THRESH_NS
-pub const HEAVY_DEMOTION_NS: u64 = 2_000_000; // 2.0MS: AGGRESSIVE
-
 // CLASSIFIER THRESHOLDS
 // LAT_CRI SCORE BOUNDARIES FOR TIER CLASSIFICATION
 // EXPOSED AS TUNING KNOBS FOR RUNTIME ADJUSTMENT
@@ -66,12 +59,19 @@ pub struct TuningKnobs {
     pub preempt_thresh_ns: u64,
     pub lag_scale: u64,
     pub batch_slice_ns: u64,
-    pub cpu_bound_thresh_ns: u64,
     pub lat_cri_thresh_high: u64,
     pub lat_cri_thresh_low: u64,
     pub affinity_mode: u64,
     pub sojourn_thresh_ns: u64,
     pub burst_slice_ns: u64,
+    // FIEDLER-DERIVED TOPOLOGY TIME CONSTANT (TAU_SCALE_NS / lambda_2).
+    // ZERO MEANS RUST HAS NOT YET WRITTEN tau; BPF USES THE PRE-FIRST-TICK
+    // FALLBACK CONSTANTS UNTIL A NONZERO VALUE LANDS. WRITTEN BY RUST AT
+    // TOPOLOGY DETECT AND ON HOTPLUG; READ BY BPF AT THE FIRST CPU-0 TICK.
+    pub topology_tau_ns: u64,
+    // R_eff-DERIVED CODEL EQUILIBRIUM TARGET (<R_eff> * 2m * tau).
+    // CO-LOCATED WITH topology_tau_ns; SAME ZERO/WRITE/CLAMP SEMANTICS.
+    pub codel_eq_ns: u64,
 }
 
 impl Default for TuningKnobs {
@@ -81,12 +81,13 @@ impl Default for TuningKnobs {
             preempt_thresh_ns: 1_000_000,
             lag_scale: 4,
             batch_slice_ns: 20_000_000,
-            cpu_bound_thresh_ns: MIXED_DEMOTION_NS,
             lat_cri_thresh_high: DEFAULT_LAT_CRI_THRESH_HIGH,
             lat_cri_thresh_low: DEFAULT_LAT_CRI_THRESH_LOW,
             affinity_mode: AFFINITY_OFF,
             sojourn_thresh_ns: 5_000_000,
             burst_slice_ns: 1_000_000,
+            topology_tau_ns: 0,
+            codel_eq_ns: 0,
         }
     }
 }
@@ -128,65 +129,84 @@ pub fn regime_knobs(r: Regime) -> TuningKnobs {
             preempt_thresh_ns: LIGHT_PREEMPT_NS,
             lag_scale: LIGHT_LAG_SCALE,
             batch_slice_ns: LIGHT_BATCH_NS,
-            cpu_bound_thresh_ns: LIGHT_DEMOTION_NS,
             lat_cri_thresh_high: DEFAULT_LAT_CRI_THRESH_HIGH,
             lat_cri_thresh_low: DEFAULT_LAT_CRI_THRESH_LOW,
             affinity_mode: AFFINITY_WEAK,
             sojourn_thresh_ns: 5_000_000,
             burst_slice_ns: 1_000_000,
+            topology_tau_ns: 0,
+            codel_eq_ns: 0,
         },
         Regime::Mixed => TuningKnobs {
             slice_ns: MIXED_SLICE_NS,
             preempt_thresh_ns: MIXED_PREEMPT_NS,
             lag_scale: MIXED_LAG_SCALE,
             batch_slice_ns: MIXED_BATCH_NS,
-            cpu_bound_thresh_ns: MIXED_DEMOTION_NS,
             lat_cri_thresh_high: DEFAULT_LAT_CRI_THRESH_HIGH,
             lat_cri_thresh_low: DEFAULT_LAT_CRI_THRESH_LOW,
             affinity_mode: AFFINITY_STRONG,
             sojourn_thresh_ns: 5_000_000,
             burst_slice_ns: 1_000_000,
+            topology_tau_ns: 0,
+            codel_eq_ns: 0,
         },
         Regime::Heavy => TuningKnobs {
             slice_ns: HEAVY_SLICE_NS,
             preempt_thresh_ns: HEAVY_PREEMPT_NS,
             lag_scale: HEAVY_LAG_SCALE,
             batch_slice_ns: HEAVY_BATCH_NS,
-            cpu_bound_thresh_ns: HEAVY_DEMOTION_NS,
             lat_cri_thresh_high: DEFAULT_LAT_CRI_THRESH_HIGH,
             lat_cri_thresh_low: DEFAULT_LAT_CRI_THRESH_LOW,
             affinity_mode: AFFINITY_WEAK,
             sojourn_thresh_ns: 5_000_000,
             burst_slice_ns: 1_000_000,
+            topology_tau_ns: 0,
+            codel_eq_ns: 0,
         },
     }
 }
 
-// CORE-COUNT-AWARE REGIME KNOBS
-// AT LOW CORE COUNTS, TIME SLICES MUST BE SHORTER TO MAINTAIN ADEQUATE
-// DISPATCH FREQUENCY. HEAVY AT 2C WITH 4MS SLICES = 250 DISPATCHES/S/CORE,
-// TOO COARSE FOR DEADLINE AND IPC WORKLOADS.
-// SCALE: slice = min(BASE, nr_cpus * 500US), preempt = min(BASE, nr_cpus * 250US).
-// MIXED ALSO SCALES: BATCH_SLICE CAPS AT nr_cpus * 5MS (2C: 10MS VS 20MS BASE).
+// TAU-SCALED REGIME KNOBS
+// CAPS DIMENSIONED AS Q16 FIXED-POINT MULTIPLIERS OF tau_ns. k_i CALIBRATED
+// AGAINST THE 12C REFERENCE TOPOLOGY (tau ~= 40MS):
+//   SLICE_CAP:   0.15 -> 6MS  AT tau=40MS
+//   PREEMPT_CAP: 0.075 -> 3MS AT tau=40MS
+//   BATCH_CAP:   1.5 -> 60MS  AT tau=40MS (Mixed ONLY)
+//   SOJOURN:     0.15 -> 6MS  AT tau=40MS
+// PER-CAP CLAMPS ARE SAFETY RAILS.
+const K_SLICE_CAP_Q16: u64 = 9830; // 0.15
+const K_PREEMPT_CAP_Q16: u64 = 4915; // 0.075
+const K_BATCH_CAP_Q16: u64 = 98304; // 1.5
+const K_SOJOURN_Q16: u64 = 9830; // 0.15
 
-pub fn scaled_regime_knobs(r: Regime, nr_cpus: u64) -> TuningKnobs {
+// FORK-STORM RAW-WAKE-RATE THRESHOLD. Q16 RATIO INTERPRETED AS
+// "WAKES/SEC PER MS-OF-tau", SO scale_tau_u64(tau, K) PRODUCES
+// THE TOTAL-WAKE THRESHOLD (NOT PER-CPU). AT THE 12C REFERENCE
+// (tau=40MS) THE GATE FIRES AT ~8000 WAKE/S, TIGHTENING LINEARLY
+// AT LOWER tau (1200/S AT 4C, 400/S AT THE 2C FLOOR).
+const K_FORK_STORM_RATE_Q16: u64 = 13107; // 0.20
+const FORK_STORM_RATE_FLOOR: u64 = 200; // HZ; CLAMPS BELOW tau=1MS
+
+#[inline]
+fn scale_tau_u64(tau_ns: u64, k_q16: u64) -> u64 {
+    (tau_ns as u128 * k_q16 as u128 >> 16) as u64
+}
+
+pub fn scaled_regime_knobs(r: Regime, _nr_cpus: u64, tau_ns: u64) -> TuningKnobs {
     let mut knobs = regime_knobs(r);
-    match r {
-        Regime::Heavy | Regime::Light => {
-            let slice_cap = nr_cpus * 500_000;
-            let preempt_cap = nr_cpus * 250_000;
-            knobs.slice_ns = knobs.slice_ns.min(slice_cap);
-            knobs.preempt_thresh_ns = knobs.preempt_thresh_ns.min(preempt_cap);
-        }
-        Regime::Mixed => {
-            let slice_cap = nr_cpus * 500_000;
-            let preempt_cap = nr_cpus * 500_000;
-            knobs.slice_ns = knobs.slice_ns.min(slice_cap);
-            knobs.preempt_thresh_ns = knobs.preempt_thresh_ns.min(preempt_cap);
-            let batch_cap = nr_cpus * 5_000_000;
-            knobs.batch_slice_ns = knobs.batch_slice_ns.min(batch_cap);
-        }
+
+    let slice_cap_tau = scale_tau_u64(tau_ns, K_SLICE_CAP_Q16).clamp(500_000, 8_000_000);
+    let preempt_cap_tau = scale_tau_u64(tau_ns, K_PREEMPT_CAP_Q16).clamp(250_000, 4_000_000);
+    let sojourn_tau = scale_tau_u64(tau_ns, K_SOJOURN_Q16).clamp(2_000_000, 6_000_000);
+
+    knobs.slice_ns = knobs.slice_ns.min(slice_cap_tau);
+    knobs.preempt_thresh_ns = knobs.preempt_thresh_ns.min(preempt_cap_tau);
+    if matches!(r, Regime::Mixed) {
+        let batch_cap_tau = scale_tau_u64(tau_ns, K_BATCH_CAP_Q16).clamp(10_000_000, 80_000_000);
+        knobs.batch_slice_ns = knobs.batch_slice_ns.min(batch_cap_tau);
     }
+    knobs.sojourn_thresh_ns = sojourn_tau;
+
     knobs
 }
 
@@ -285,26 +305,361 @@ pub fn compute_p99_from_histogram(counts: &[u64; HIST_BUCKETS]) -> u64 {
     HIST_EDGES_NS[HIST_BUCKETS - 2]
 }
 
-// REFLEX TIGHTEN DECISION: USES BOTH AGGREGATE AND INTERACTIVE P99.
-// TIGHTEN IF EITHER EXCEEDS CEILING (INTERACTIVE STARVATION HIDDEN IN AGGREGATE).
-pub fn should_reflex_tighten(aggregate_p99: u64, interactive_p99: u64, ceiling: u64) -> bool {
-    aggregate_p99 > ceiling || interactive_p99 > ceiling
+// MWU ORCHESTRATOR
+// SCHMITT-GATED MULTIPLICATIVE WEIGHT UPDATES ACROSS ALL 11 TUNING KNOBS.
+// 6 EXPERT PROFILES, EACH A SCALE FACTOR ON THE REGIME BASELINE.
+// CORRECTED SCALE FACTORS: sum(EQ[i] * SCALE[i]) = 1.0 FOR EACH CONTINUOUS KNOB.
+// DISCRETE KNOBS (LAG, AFFINITY, DEPTH) USE MAJORITY VOTE, NOT WEIGHTED AVERAGE.
+// 4 LOSS PATHWAYS: P99 SPIKE, RESCUE DELTA, IO DELTA, FORK STORM.
+// 1e-6 WEIGHT FLOOR PREVENTS UNDERFLOW (DEAD WEIGHTS CAN'T RECOVER).
+
+const N_EXPERTS: usize = 6;
+const ETA: f64 = 8.0;
+const RELAX_RATE: f64 = 0.80;
+const SPIKE_CONFIRM: u32 = 2;
+const RELAX_HOLD: u32 = 2;
+const RELAX_CEIL_PCT: f64 = 0.70;
+const EQUILIBRIUM: [f64; N_EXPERTS] = [0.08, 0.44, 0.12, 0.12, 0.12, 0.12];
+const WEIGHT_FLOOR: f64 = 1e-6;
+
+const EX_LATENCY: usize = 0;
+const EX_BALANCED: usize = 1;
+const EX_THROUGHPUT: usize = 2;
+const EX_IO_HEAVY: usize = 3;
+const EX_FORK_STORM: usize = 4;
+const EX_SATURATED: usize = 5;
+
+// CORRECTED CONTINUOUS SCALE FACTORS
+// PROPORTIONALLY ADJUSTED SO sum(EQ[i] * SCALE[i]) = 1.0 AT EQUILIBRIUM.
+// [LATENCY, BALANCED, THROUGHPUT, IO_HEAVY, FORK_STORM, SATURATED]
+const SC_SLICE: [f64; 6] = [0.74, 1.00, 1.23, 0.98, 0.49, 1.47];
+const SC_PREEMPT: [f64; 6] = [0.74, 1.00, 1.23, 0.98, 0.49, 1.47];
+const SC_BATCH: [f64; 6] = [0.78, 1.00, 1.30, 1.30, 0.52, 1.04];
+const SC_LCRI_HI: [f64; 6] = [0.74, 1.00, 1.23, 0.98, 0.98, 0.98];
+const SC_LCRI_LO: [f64; 6] = [0.70, 1.00, 1.40, 0.93, 0.93, 0.93];
+const SC_SOJOURN: [f64; 6] = [0.80, 1.00, 1.60, 0.93, 0.53, 1.07];
+const SC_BURST: [f64; 6] = [0.74, 1.00, 1.47, 0.98, 0.49, 1.23];
+
+// DISCRETE KNOB VALUES (ABSOLUTE, NOT SCALE FACTORS)
+const DV_LAG: [u64; 6] = [6, 4, 3, 4, 4, 3];
+const DV_AFFINITY: [u64; 6] = [
+    AFFINITY_STRONG,
+    AFFINITY_STRONG,
+    AFFINITY_WEAK,
+    AFFINITY_WEAK,
+    AFFINITY_OFF,
+    AFFINITY_WEAK,
+];
+fn blend_continuous(base: u64, scales: &[f64; 6], w: &[f64; N_EXPERTS]) -> u64 {
+    let v: f64 = (0..N_EXPERTS).map(|i| w[i] * base as f64 * scales[i]).sum();
+    (v.round() as u64).max(1)
 }
 
-// SLEEP-INFORMED BATCH TUNING
-// IO-HEAVY: EXTEND BATCH SLICES (+25%) -- IO-BOUND TASKS BATCH BETWEEN FREQUENT SHORT SLEEPS
-// IDLE-HEAVY: TIGHTEN BATCH SLICES (-25%) -- SPORADIC USER INPUT NEEDS FASTER PREEMPTION
+fn majority_discrete(values: &[u64; 6], w: &[f64; N_EXPERTS]) -> u64 {
+    // GROUP BY VALUE, SUM WEIGHTS, PICK HIGHEST GROUP
+    let mut best_val = values[0];
+    let mut best_w = 0.0f64;
+    for &v in values.iter() {
+        let total: f64 = (0..N_EXPERTS)
+            .filter(|&i| values[i] == v)
+            .map(|i| w[i])
+            .sum();
+        if total > best_w {
+            best_w = total;
+            best_val = v;
+        }
+    }
+    best_val
+}
 
-pub const BATCH_MAX_NS: u64 = 25_000_000; // 25MS CEILING
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum IoBucket {
+    Low,
+    Mid,
+    High,
+}
 
-pub fn sleep_adjust_batch_ns(base_batch_ns: u64, io_pct: u64) -> u64 {
+pub fn io_bucket(io_pct: u64) -> IoBucket {
     if io_pct > 60 {
-        // IO-HEAVY: EXTEND BATCH SLICES (+25%)
-        (base_batch_ns * 5 / 4).min(BATCH_MAX_NS)
+        IoBucket::High
     } else if io_pct < 15 {
-        // IDLE-HEAVY: TIGHTEN BATCH SLICES (-25%)
-        (base_batch_ns * 3 / 4).max(base_batch_ns / 2)
+        IoBucket::Low
     } else {
-        base_batch_ns
+        IoBucket::Mid
+    }
+}
+
+pub struct MwuSignals {
+    pub p99_ns: u64,
+    pub interactive_p99_ns: u64,
+    pub io_pct: u64,
+    pub rescue_count: u64,
+    pub wakeup_rate: u64,
+}
+
+// SNAPSHOT OF THE BPF DAMPED-HARMONIC OSCILLATOR'S ADAPTIVE STATE.
+// MWU READS THIS BEFORE COMPUTING PATHWAY LOSSES SO IT CAN AVOID
+// DOUBLE-CORRECTING ON RESCUE PRESSURE: WHEN THE OSCILLATOR HAS
+// ALREADY TIGHTENED codel_target_ns TOWARD THE FLOOR, BPF HAS
+// RESPONDED -- MWU STAYS OUT. WHEN THE OSCILLATOR IS NEAR THE
+// CEILING, NO RESCUE PRESSURE EXISTS FOR MWU TO AMPLIFY.
+//
+// ALL FIELDS ZERO = SENTINEL ("READBACK UNAVAILABLE / INIT") -> NO GATING.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct OscillatorState {
+    pub codel_target_ns: u64,
+    pub codel_target_floor_ns: u64,
+    pub codel_target_max_ns: u64,
+}
+
+impl OscillatorState {
+    // 0.0 = AT FLOOR (TIGHTENED), 1.0 = AT MAX (RELAXED).
+    // SENTINEL OR DEGENERATE RANGE -> 0.5 (CENTER, NEUTRAL).
+    pub fn position(&self) -> f64 {
+        if self.codel_target_max_ns == 0 || self.codel_target_floor_ns >= self.codel_target_max_ns {
+            return 0.5;
+        }
+        let range = (self.codel_target_max_ns - self.codel_target_floor_ns) as f64;
+        let pos = self
+            .codel_target_ns
+            .saturating_sub(self.codel_target_floor_ns) as f64;
+        (pos / range).clamp(0.0, 1.0)
+    }
+}
+
+pub struct MwuController {
+    weights: [f64; N_EXPERTS],
+    baseline: TuningKnobs,
+    spike_streak: u32,
+    healthy_streak: u32,
+    fork_streak: u32,
+    prev_io_bucket: IoBucket,
+    prev_rescuing: bool,
+    losses_applied: bool,
+}
+
+impl MwuController {
+    pub fn new(baseline: TuningKnobs) -> Self {
+        Self {
+            weights: EQUILIBRIUM,
+            baseline,
+            spike_streak: 0,
+            healthy_streak: 0,
+            fork_streak: 0,
+            prev_io_bucket: IoBucket::Mid,
+            prev_rescuing: false,
+            losses_applied: false,
+        }
+    }
+
+    pub fn reset(&mut self) {
+        self.weights = EQUILIBRIUM;
+        self.spike_streak = 0;
+        self.healthy_streak = 0;
+        self.fork_streak = 0;
+        self.prev_io_bucket = IoBucket::Mid;
+        self.prev_rescuing = false;
+        self.losses_applied = false;
+    }
+
+    pub fn set_baseline(&mut self, baseline: TuningKnobs) {
+        self.baseline = baseline;
+    }
+
+    pub fn update(
+        &mut self,
+        sig: &MwuSignals,
+        ceiling: u64,
+        _nr_cpus: u64,
+        tau_ns: u64,
+        osc: &OscillatorState,
+    ) -> TuningKnobs {
+        let worst = sig.p99_ns.max(sig.interactive_p99_ns);
+        let above = worst > ceiling;
+        let below_relax = (worst as f64) < (ceiling as f64 * RELAX_CEIL_PCT);
+
+        // OSCILLATOR-AWARE GATING. THE BPF DAMPED OSCILLATOR ALREADY
+        // CONSUMES global_rescue_count AND ADAPTS codel_target_ns ON
+        // EVERY TICK. PATHWAYS THAT TRIGGER ON THE SAME RESCUE SIGNAL
+        // (PATHWAY 2 RESCUE-DELTA, PATHWAY 4 FORK-STORM) SHOULD DEFER
+        // TO IT WHEN THE OSCILLATOR HAS ALREADY MOVED -- OTHERWISE BOTH
+        // CONTROLLERS PUSH IN THE SAME DIRECTION AND OVERSHOOT.
+        //
+        // POSITION 0.0 = TIGHTENED (FLOOR), 1.0 = RELAXED (MAX).
+        // < 0.40 -> BPF HAS RESPONDED HEAVILY; SKIP RESCUE-DRIVEN LOSSES.
+        // > 0.90 -> BPF SAYS QUIET; RESCUE BURSTS ARE STALE NOISE; SKIP.
+        let osc_pos = osc.position();
+        let osc_already_tight = osc_pos < 0.40;
+        let osc_already_loose = osc_pos > 0.90;
+        let defer_to_oscillator = osc_already_tight || osc_already_loose;
+
+        let mut losses = [0.0f64; N_EXPERTS];
+        let mut has_loss = false;
+
+        // PATHWAY 1: P99 SPIKE (SCHMITT-GATED)
+        if above {
+            self.healthy_streak = 0;
+            self.spike_streak += 1;
+            if self.spike_streak >= SPIKE_CONFIRM {
+                let v = ((worst - ceiling) as f64 / ceiling as f64).min(3.0);
+                losses[EX_BALANCED] += v * 0.5;
+                losses[EX_THROUGHPUT] += v * 1.0;
+                losses[EX_IO_HEAVY] += v * 0.6;
+                losses[EX_FORK_STORM] += v * 0.3;
+                losses[EX_SATURATED] += v * 0.9;
+                has_loss = true;
+            }
+        } else {
+            self.spike_streak = 0;
+        }
+
+        // PATHWAY 2: RESCUE DELTA (0 -> NONZERO TRANSITION)
+        // PATHWAY 2: RESCUE DELTA (0 -> NONZERO TRANSITION)
+        // PENALIZE ALL EXPERTS EQUALLY: THE DAMPED OSCILLATION IN BPF
+        // HANDLES TIGHTENING VIA THE CODEL TARGET. MWU SHOULD HOLD STEADY,
+        // NOT COMPOUND BY ALSO TIGHTENING SLICES VIA LATENCY EXPERT.
+        let rescuing = sig.rescue_count > 0;
+        if rescuing && !self.prev_rescuing && !defer_to_oscillator {
+            let v = (sig.rescue_count as f64 * 1.5).min(3.0);
+            losses[EX_LATENCY] += v * 0.4;
+            losses[EX_THROUGHPUT] += v * 0.6;
+            losses[EX_SATURATED] += v * 0.6;
+            losses[EX_IO_HEAVY] += v * 0.4;
+            losses[EX_BALANCED] += v * 0.2;
+            has_loss = true;
+        }
+        self.prev_rescuing = rescuing;
+
+        // PATHWAY 3: IO DELTA (BUCKET TRANSITION)
+        let cur_io = io_bucket(sig.io_pct);
+        if cur_io != self.prev_io_bucket {
+            match cur_io {
+                IoBucket::High => {
+                    let v = ((sig.io_pct as f64 - 60.0) / 40.0).min(1.0);
+                    for i in 0..N_EXPERTS {
+                        if i != EX_IO_HEAVY {
+                            losses[i] += v * 0.8;
+                        }
+                    }
+                    has_loss = true;
+                }
+                IoBucket::Low => {
+                    let v = ((15.0 - sig.io_pct as f64) / 15.0).clamp(0.0, 1.0);
+                    losses[EX_IO_HEAVY] += v * 1.0;
+                    has_loss = true;
+                }
+                IoBucket::Mid => {}
+            }
+        }
+        self.prev_io_bucket = cur_io;
+
+        // PATHWAY 4: FORK STORM (SCHMITT-GATED, PRESSURE-CONFIRMED).
+        // GATE THRESHOLD IS TAU-DERIVED. sig.wakeup_rate IS THE RAW TOTAL
+        // WAKES/SEC; scale_tau_u64(tau, K_FORK_STORM_RATE_Q16) PRODUCES
+        // THE COMPARISON THRESHOLD. AT THE 12C REFERENCE (tau=40MS) THE
+        // THRESHOLD IS ~8000/SEC; AT 4C IT TIGHTENS TO ~1200/SEC. A FORK
+        // STORM ALSO REQUIRES ACTIVE RESCUES (rescue_count > 0) AS GROUND-
+        // TRUTH PRESSURE.
+        //
+        // FORK_STORM EXPERT (SC_SLICE=0.49, SC_PREEMPT=0.49, SC_BATCH=0.52,
+        // SC_SOJOURN=0.53, SC_BURST=0.49) DOMINATES THE BLEND DURING A REAL
+        // STORM, DRIVING burst_slice_ns / preempt_thresh_ns / sojourn_thresh_ns
+        // / batch_slice_ns DOWN END-TO-END.
+        let fork_thresh = scale_tau_u64(tau_ns, K_FORK_STORM_RATE_Q16).max(FORK_STORM_RATE_FLOOR);
+        let fork_storm = sig.wakeup_rate > fork_thresh && sig.rescue_count > 0;
+        if fork_storm {
+            self.fork_streak += 1;
+            if self.fork_streak >= SPIKE_CONFIRM && !defer_to_oscillator {
+                let denom = fork_thresh.max(1) as f64;
+                let v = ((sig.wakeup_rate as f64 / denom) - 1.0).clamp(0.0, 3.0);
+                losses[EX_BALANCED] += v * 0.30;
+                losses[EX_THROUGHPUT] += v * 1.00;
+                losses[EX_IO_HEAVY] += v * 0.50;
+                losses[EX_SATURATED] += v * 0.80;
+                has_loss = true;
+            }
+        } else {
+            self.fork_streak = 0;
+        }
+
+        // APPLY LOSSES WITH WEIGHT FLOOR
+        if has_loss {
+            for i in 0..N_EXPERTS {
+                if losses[i] > 0.0 {
+                    self.weights[i] *= (-ETA * losses[i]).exp();
+                }
+                if self.weights[i] < WEIGHT_FLOOR {
+                    self.weights[i] = WEIGHT_FLOOR;
+                }
+            }
+            let sum: f64 = self.weights.iter().sum();
+            for w in self.weights.iter_mut() {
+                *w /= sum;
+            }
+        }
+
+        // RELAXATION
+        if !has_loss && below_relax {
+            self.healthy_streak += 1;
+            if self.healthy_streak >= RELAX_HOLD {
+                for i in 0..N_EXPERTS {
+                    self.weights[i] =
+                        (1.0 - RELAX_RATE) * self.weights[i] + RELAX_RATE * EQUILIBRIUM[i];
+                }
+            }
+        } else if !has_loss {
+            self.healthy_streak = 0;
+        }
+
+        self.losses_applied = has_loss;
+
+        // BLEND: CONTINUOUS KNOBS VIA CORRECTED SCALE FACTORS, DISCRETE VIA MAJORITY
+        let b = &self.baseline;
+        let blended_slice = blend_continuous(b.slice_ns, &SC_SLICE, &self.weights);
+        let blended_burst = blend_continuous(b.burst_slice_ns, &SC_BURST, &self.weights);
+        let mut blended_sojourn = blend_continuous(b.sojourn_thresh_ns, &SC_SOJOURN, &self.weights);
+
+        // SOJOURN FLOOR: dispatch waterfall services aged overflow at
+        // overflow_sojourn_rescue_ns (BPF-side, tau-clamped to [4ms, 10ms]).
+        // tick() also kicks per-CPU DSQs whose oldest task has aged past
+        // sojourn_thresh_ns. If MWU drives sojourn_thresh_ns below the
+        // dispatch service window + one slice, every tick generates kicks
+        // on per-CPU DSQs that the dispatcher will service on the next
+        // dispatch anyway -- a kick storm. Floor against the worst-case
+        // dispatch service window to prevent it.
+        let sojourn_floor = 4_000_000u64.saturating_add(blended_slice);
+        if blended_sojourn < sojourn_floor {
+            blended_sojourn = sojourn_floor;
+        }
+
+        TuningKnobs {
+            slice_ns: blended_slice,
+            preempt_thresh_ns: blend_continuous(b.preempt_thresh_ns, &SC_PREEMPT, &self.weights),
+            lag_scale: majority_discrete(&DV_LAG, &self.weights),
+            batch_slice_ns: blend_continuous(b.batch_slice_ns, &SC_BATCH, &self.weights),
+            lat_cri_thresh_high: blend_continuous(
+                b.lat_cri_thresh_high,
+                &SC_LCRI_HI,
+                &self.weights,
+            ),
+            lat_cri_thresh_low: blend_continuous(b.lat_cri_thresh_low, &SC_LCRI_LO, &self.weights),
+            affinity_mode: majority_discrete(&DV_AFFINITY, &self.weights),
+            sojourn_thresh_ns: blended_sojourn,
+            burst_slice_ns: blended_burst,
+            // topology_tau_ns AND codel_eq_ns ARE OWNED BY THE TOPOLOGY LAYER;
+            // MWU DOESN'T TOUCH THEM. THE MONITOR LOOP OVERLAYS THE LIVE BPF
+            // VALUES BACK ONTO MWU'S OUTPUT BEFORE WRITING -- PASSTHROUGH.
+            topology_tau_ns: 0,
+            codel_eq_ns: 0,
+        }
+    }
+
+    pub fn had_losses(&self) -> bool {
+        self.losses_applied
+    }
+
+    pub fn scale(&self) -> f64 {
+        let s: f64 = (0..N_EXPERTS).map(|i| self.weights[i] * SC_SLICE[i]).sum();
+        s
     }
 }

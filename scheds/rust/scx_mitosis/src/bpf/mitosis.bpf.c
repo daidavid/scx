@@ -28,6 +28,7 @@
 
 #include "mitosis.bpf.h"
 #include "dsq.bpf.h"
+#include "slice_shrinking.bpf.h"
 #include "llc_aware.bpf.h"
 
 char _license[] SEC("license") = "GPL";
@@ -323,24 +324,6 @@ static inline void record_cgroup_exit(u64 cgid)
 
 struct cell_cpumask_map cell_cpumasks SEC(".maps");
 
-/*
- * Helper functions for bumping per-cell stats
- */
-static void cstat_add(enum cell_stat_idx idx, u32 cell, struct cpu_ctx *cctx, s64 delta)
-{
-	u64 *vptr;
-
-	if ((vptr = MEMBER_VPTR(*cctx, .cstats[cell][idx])))
-		(*vptr) += delta;
-	else
-		scx_bpf_error("invalid cell or stat idxs: %d, %d", idx, cell);
-}
-
-static void cstat_inc(enum cell_stat_idx idx, u32 cell, struct cpu_ctx *cctx)
-{
-	cstat_add(idx, cell, cctx, 1);
-}
-
 static inline int update_task_cpumask(struct task_struct *p, struct task_ctx *tctx)
 {
 	const struct cpumask *cell_cpumask;
@@ -601,6 +584,7 @@ static __always_inline s32 try_pick_idle_cpu(struct task_struct *p, s32 prev_cpu
 		 * enqueue), SCX_DSQ_LOCAL resolves to task_rq(p) -- not
 		 * the idle CPU we picked.
 		 */
+		tctx->vtime_charge_cell = tctx->cell;
 		scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | cpu, slice_ns, 0);
 		if (kick)
 			scx_bpf_kick_cpu(cpu, SCX_KICK_IDLE);
@@ -624,6 +608,7 @@ static __always_inline s32 try_pick_idle_cpu(struct task_struct *p, s32 prev_cpu
 		if (cpu >= 0) {
 			tctx->borrowed = true;
 			cstat_inc(CSTAT_BORROWED, tctx->cell, cctx);
+			tctx->vtime_charge_cell = tctx->cell;
 			scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | cpu, slice_ns, 0);
 			if (kick)
 				scx_bpf_kick_cpu(cpu, SCX_KICK_IDLE);
@@ -720,8 +705,10 @@ s32 BPF_STRUCT_OPS(mitosis_select_cpu, struct task_struct *p, s32 prev_cpu, u64 
 		if (cpu < 0)
 			return prev_cpu;
 
-		if (idle_cpu_cleared || scx_bpf_test_and_clear_cpu_idle(cpu))
+		if (idle_cpu_cleared || scx_bpf_test_and_clear_cpu_idle(cpu)) {
+			tctx->vtime_charge_cell = tctx->cell;
 			scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, slice_ns, 0);
+		}
 		return cpu;
 	}
 
@@ -787,6 +774,19 @@ void BPF_STRUCT_OPS(mitosis_enqueue, struct task_struct *p, u64 enq_flags)
 
 	if (maybe_refresh_cell(p, tctx) < 0)
 		return;
+
+	/*
+	 * CPU -> cell mappings can change between enqueue() and stopping().
+	 * If that happens, the task's dsq_vtime may no longer belong to the
+	 * CPU-local or shared cell vtime domains visible at stopping(), and
+	 * advancing either one would charge the wrong domain.
+	 * Direct local insert paths snapshot the same state before inserting.
+	 *
+	 * Snapshot the cell whose vtime domain this placement expects to
+	 * charge. stopping() only advances local and cell vtime if the task
+	 * is not borrowed and the CPU it stops on is still in this same cell.
+	 */
+	tctx->vtime_charge_cell = tctx->cell;
 
 	/* Ensure this is done *AFTER* refreshing cell which might manipulate vtime */
 	vtime = p->scx.dsq_vtime;
@@ -875,25 +875,18 @@ void BPF_STRUCT_OPS(mitosis_enqueue, struct task_struct *p, u64 enq_flags)
 
 	scx_bpf_dsq_insert_vtime(p, tctx->dsq.raw, slice_ns, vtime, enq_flags);
 
+	/* Shrink the running task's slice for this pinned waiter.
+	 * We know this task is pinned (!all_cell_cpus_allowed). */
+	if (!tctx->all_cell_cpus_allowed && enable_slice_shrinking) {
+		struct task_struct *curr = __COMPAT_scx_bpf_cpu_curr(cpu);
+		/* Likely overly defensive bc no other should read */
+		if (curr && !(curr->flags & PF_IDLE))
+			slice_shrink_on_enqueue(curr, tctx, tctx->cell, cctx);
+	}
+
 	/* Kick the CPU if needed */
 	if (!__COMPAT_is_enq_cpu_selected(enq_flags) && cpu >= 0)
 		scx_bpf_kick_cpu(cpu, SCX_KICK_IDLE);
-}
-
-/*
- * Peek at the head of a DSQ. By default use a bpf_for_each iterator loop.
- * When use_lockless_peek is set, use the lockless scx_bpf_dsq_peek() kfunc.
- */
-static inline struct task_struct *dsq_peek(u64 dsq_id)
-{
-	struct task_struct *p;
-
-	if (use_lockless_peek)
-		return __COMPAT_scx_bpf_dsq_peek(dsq_id);
-
-	bpf_for_each(scx_dsq, p, dsq_id, 0)
-		return p;
-	return NULL;
 }
 
 void BPF_STRUCT_OPS(mitosis_dispatch, s32 cpu, struct task_struct *prev)
@@ -1355,7 +1348,15 @@ void BPF_STRUCT_OPS(mitosis_running, struct task_struct *p)
 			return;
 	}
 
+	/* Record the running slice start time. */
 	tctx->started_running_at = scx_bpf_now();
+
+	/* Shrink our slice if a pinned task is queued on this CPU's DSQ. */
+	if (enable_slice_shrinking) {
+		int ret = slice_shrink_on_running(p, tctx->cell, cctx);
+		if (ret < 0)
+			return;
+	}
 }
 
 void BPF_STRUCT_OPS(mitosis_stopping, struct task_struct *p, bool runnable)
@@ -1388,6 +1389,9 @@ void BPF_STRUCT_OPS(mitosis_stopping, struct task_struct *p, bool runnable)
 		cstat_inc(CSTAT_CLAMP_USED, cidx, cctx);
 	used = time_delta(now, tctx->started_running_at);
 	tctx->started_running_at = now;
+
+	update_task_runtime_ewma(tctx, used);
+
 	/* scale the execution time by the inverse of the weight and charge */
 	if (p->scx.weight == 0) {
 		scx_bpf_error("Task %d has zero weight", p->pid);
@@ -1396,32 +1400,29 @@ void BPF_STRUCT_OPS(mitosis_stopping, struct task_struct *p, bool runnable)
 	p->scx.dsq_vtime += used * 100 / p->scx.weight;
 
 	/*
-	 * Advance this CPU's per-CPU DSQ vtime, UNLESS the task was
-	 * genuinely borrowed from another cell. Borrowed tasks' vtime
-	 * is in the borrowing cell's domain — writing it to the lending
-	 * CPU's vtime_now would contaminate that domain.
-	 *
-	 * For cell-reassigned tasks (tctx->cell != cidx but not borrowed),
-	 * the vtime was initialized in this CPU's cell domain, so
-	 * advancing cctx->vtime_now is correct and prevents staleness.
+	 * Only advance this CPU's local vtime when the slice ends on a CPU
+	 * whose cell matches this task's vtime charge cell and the task was
+	 * not borrowed. If execution ends in some other cell, drop the local
+	 * charge rather than risk charging an unexpected domain.
 	 */
-	if (!tctx->borrowed) {
+	if (!tctx->borrowed && tctx->vtime_charge_cell == cidx) {
 		if (time_before(READ_ONCE(cctx->vtime_now), p->scx.dsq_vtime))
 			WRITE_ONCE(cctx->vtime_now, p->scx.dsq_vtime);
 	}
 
+	/*
+	 * Only advance cell vtime when the task stops on a CPU whose cell
+	 * still matches this task's vtime charge cell and the task was not
+	 * borrowed. If the CPU was retagged into a different cell after the
+	 * task was placed, drop the charge rather than advance the wrong cell
+	 * domain.
+	 */
+	if (!tctx->borrowed && tctx->vtime_charge_cell == cidx) {
+		advance_cell_llc_vtime(cell, tctx, p->scx.dsq_vtime);
+	}
+
 	/* Clear the borrowed flag — it is one-shot, consumed above */
 	tctx->borrowed = false;
-
-	struct cell *vtime_cell;
-	if (tctx->cell != cidx) {
-		vtime_cell = lookup_cell(tctx->cell);
-		if (!vtime_cell)
-			return;
-	} else {
-		vtime_cell = cell;
-	}
-	advance_cell_llc_vtime(vtime_cell, tctx, p->scx.dsq_vtime);
 
 	{
 		u64 *running = MEMBER_VPTR(cctx->running_ns, [tctx->cell]);

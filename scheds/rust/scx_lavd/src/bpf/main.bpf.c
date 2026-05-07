@@ -607,13 +607,8 @@ static void account_task_runtime(struct task_struct *p,
 	 * Under CPU bandwidth control using cpu.max, we also need to report
 	 * how much time was actually consumed compared to the reserved time.
 	 */
-	if (enable_cpu_bw && (p->pid != lavd_pid)) {
-		struct cgroup *cgrp = bpf_cgroup_from_id(taskc->cgrp_id);
-		if (cgrp) {
-			scx_cgroup_bw_consume(cgrp, task_time_wall);
-			bpf_cgroup_release(cgrp);
-		}
-	}
+	if (enable_cpu_bw && (p->pid != lavd_pid))
+		scx_cgroup_bw_consume(taskc->cgrp_id, task_time_wall, (u64)taskc);
 }
 
 static void update_stat_for_stopping(struct task_struct *p,
@@ -689,11 +684,12 @@ static bool can_direct_dispatch(struct cpu_ctx *cpuc, bool is_cpu_idle)
 s32 BPF_STRUCT_OPS(lavd_select_cpu, struct task_struct *p, s32 prev_cpu,
 		   u64 wake_flags)
 {
+	struct cpu_ctx *cpuc_cur = get_cpu_ctx();
 	struct pick_ctx ictx = {
 		.p = p,
-		.taskc = get_task_ctx(p),
+		.taskc = get_task_ctx_curcpu(p, cpuc_cur),
 		.prev_cpu = prev_cpu,
-		.cpuc_cur = get_cpu_ctx(),
+		.cpuc_cur = cpuc_cur,
 		.wake_flags = wake_flags,
 	};
 	struct task_struct *waker;
@@ -749,7 +745,7 @@ s32 BPF_STRUCT_OPS(lavd_select_cpu, struct task_struct *p, s32 prev_cpu,
 
 		/*
 		 * If there is an idle cpu and its associated DSQs are empty,
-		 * disptach the task to the idle cpu right now.
+		 * dispatch the task to the idle cpu right now.
 		 */
 		cpuc = get_cpu_ctx_id(cpu_id);
 		if (!cpuc) {
@@ -758,6 +754,16 @@ s32 BPF_STRUCT_OPS(lavd_select_cpu, struct task_struct *p, s32 prev_cpu,
 		}
 
 		if (can_direct_dispatch(cpuc, true)) {
+			/*
+			 * The direct-dispatch path bypasses ops.enqueue(), so
+			 * the throttle check there is never reached.  Skip the
+			 * dispatch if the cgroup is throttled; the task will
+			 * fall through to ops.enqueue() which puts it in the BTQ.
+			 */
+			if (enable_cpu_bw && (p->pid != lavd_pid) &&
+			    (scx_cgroup_bw_throttled(ictx.taskc->cgrp_id, p,
+						     (u64)ictx.taskc) == -EAGAIN))
+				goto out;
 			p->scx.dsq_vtime = calc_when_to_run(p, ictx.taskc);
 			p->scx.slice = LAVD_SLICE_MAX_NS_DFL;
 			if (ictx.taskc->tld_hint_slice_ns)
@@ -774,7 +780,6 @@ out:
 
 static int cgroup_throttled(struct task_struct *p, task_ctx *taskc, bool put_aside)
 {
-	struct cgroup *cgrp;
 	int ret, ret2;
 
 	/*
@@ -787,21 +792,13 @@ static int cgroup_throttled(struct task_struct *p, task_ctx *taskc, bool put_asi
 	 * Note that we cannot use scx_bpf_task_cgroup() here because this can
 	 * be called only from ops.enqueue() and ops.dispatch().
 	 */
-	cgrp = bpf_cgroup_from_id(taskc->cgrp_id);
-	if (!cgrp) {
-		debugln("Failed to lookup a cgroup: %llu", taskc->cgrp_id);
-		return -ESRCH;
-	}
-
-	ret = scx_cgroup_bw_throttled(cgrp, p);
+	ret = scx_cgroup_bw_throttled(taskc->cgrp_id, p, (u64)taskc);
 	if ((ret == -EAGAIN) && put_aside) {
-		ret2 = scx_cgroup_bw_put_aside(p, (u64)taskc, p->scx.dsq_vtime, cgrp);
-		if (ret2) {
-			bpf_cgroup_release(cgrp);
+		ret2 = scx_cgroup_bw_put_aside(p, (u64)taskc, p->scx.dsq_vtime,
+					       taskc->cgrp_id);
+		if (ret2)
 			return ret2;
-		}
 	}
-	bpf_cgroup_release(cgrp);
 	return ret;
 }
 
@@ -813,8 +810,8 @@ void BPF_STRUCT_OPS(lavd_enqueue, struct task_struct *p, u64 enq_flags)
 	task_ctx *taskc;
 	u64 dsq_id;
 
-	taskc = get_task_ctx(p);
 	cpuc_cur = get_cpu_ctx();
+	taskc = get_task_ctx_curcpu(p, cpuc_cur);
 	if (!taskc || !cpuc_cur) {
 		scx_bpf_error("Failed to lookup cpu_ctx %d", cpu);
 		return;
@@ -1410,6 +1407,14 @@ void BPF_STRUCT_OPS(lavd_running, struct task_struct *p)
 	task_ctx *taskc;
 	u64 now = scx_bpf_now();
 
+	/*
+	 * lavd_running() may run on a CPU other than @p's: the kernel
+	 * invokes this op with @p's rq lock held, but the calling CPU
+	 * isn't necessarily @p's CPU. For example, scx_enable_workfn()
+	 * iterates over every rq from a worker thread, locks each in
+	 * turn, and triggers set_next_task_scx() on it -- so the op
+	 * fires for tasks on remote rqs.
+	 */
 	cpuc = get_cpu_ctx_task(p);
 	taskc = get_task_ctx(p);
 	if (!cpuc || !taskc) {
@@ -1466,7 +1471,14 @@ void BPF_STRUCT_OPS(lavd_tick, struct task_struct *p)
 	u64 now;
 
 	/*
-	 * Update task statistics
+	 * Update task statistics.
+	 *
+	 * lavd_tick() may run on a CPU other than @p's: the kernel
+	 * invokes this op with @p's rq lock held, but the calling CPU
+	 * isn't necessarily @p's CPU. In NOHZ_FULL mode,
+	 * sched_tick_remote() runs as a delayed_work on a worker
+	 * thread, locks the remote rq, and calls task_tick_scx() on
+	 * its curr task -- so the op fires for tasks on remote rqs.
 	 */
 	cpuc = get_cpu_ctx_task(p);
 	taskc = get_task_ctx(p);
@@ -1532,7 +1544,14 @@ void BPF_STRUCT_OPS(lavd_stopping, struct task_struct *p, bool runnable)
 	task_ctx *taskc;
 
 	/*
-	 * Update task statistics
+	 * Update task statistics.
+	 *
+	 * lavd_stopping() may run on a CPU other than @p's: the kernel
+	 * invokes this op with @p's rq lock held, but the calling CPU
+	 * isn't necessarily @p's CPU. The kernel calls it from both
+	 * put_prev_task_scx() (always on @p's CPU) and
+	 * dequeue_task_scx() (which can run on a different CPU during
+	 * migration paths).
 	 */
 	cpuc = get_cpu_ctx_task(p);
 	taskc = get_task_ctx(p);
@@ -1550,6 +1569,13 @@ void BPF_STRUCT_OPS(lavd_quiescent, struct task_struct *p, u64 deq_flags)
 	task_ctx *taskc;
 	u64 now, interval;
 
+	/*
+	 * lavd_quiescent() may run on a CPU other than @p's: the kernel
+	 * invokes this op with @p's rq lock held, but the calling CPU
+	 * isn't necessarily @p's CPU. dequeue_task_scx() can be called
+	 * from migration paths on a different CPU than where @p was
+	 * running.
+	 */
 	cpuc = get_cpu_ctx_task(p);
 	taskc = get_task_ctx(p);
 	if (!cpuc || !taskc) {
@@ -1930,6 +1956,7 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(lavd_init_task, struct task_struct *p,
 		taskc->svc_time_iwgt = sys_stat.avg_svc_time_iwgt;
 	}
 
+	taskc->suggested_cpu_id = scx_bpf_task_cpu(p);
 	taskc->pinned_cpu_id = -ENOENT;
 	taskc->pid = p->pid;
 	taskc->cgrp_id = args->cgroup->kn->id;
@@ -1949,6 +1976,17 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(lavd_init_task, struct task_struct *p,
 s32 BPF_STRUCT_OPS(lavd_exit_task, struct task_struct *p,
 		   struct scx_exit_task_args *args)
 {
+	struct cpu_ctx *cpuc = get_cpu_ctx();
+
+	/*
+	 * Drop the local CPU's task_ctx cache entry if it points at @p.
+	 * Remote CPUs that may have cached @p rely on natural eviction by
+	 * subsequent lookups -- by design, no cross-CPU sweep here.
+	 */
+	if (cpuc && (cpuc->cached_task == (u64)p ||
+		     cpuc->cached_pid == p->pid))
+		cpuc->cached_pid = 0;
+
 	scx_task_free(p);
 	return 0;
 }
@@ -2468,7 +2506,7 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(lavd_init)
 	/*
 	 * Initialize the current logical clock and service time.
 	 */
-	WRITE_ONCE(cur_logical_clk, 0);
+	WRITE_ONCE(cur_logical_clk, LAVD_DL_COMPETE_WINDOW);
 	WRITE_ONCE(cur_svc_time_iwgt, 0);
 
 	/*
@@ -2517,9 +2555,10 @@ int set_aggressive_migration(void)
 		return 0;
 
 	cpu = bpf_get_smp_processor_id();
-	if ((curr = bpf_get_current_task_btf()) &&
-	    (taskc = get_task_ctx(curr)) &&
-	    (cpuc = get_cpu_ctx_id(cpu)) &&
+	cpuc = get_cpu_ctx();
+	if (cpuc &&
+	    (curr = bpf_get_current_task_btf()) &&
+	    (taskc = get_task_ctx_curcpu(curr, cpuc)) &&
 	    (cpdc = MEMBER_VPTR(cpdom_ctxs, [cpuc->cpdom_id])) &&
 	    READ_ONCE(cpdc->is_stealee)) {
 		set_task_flag(taskc, LAVD_FLAG_MIGRATION_AGGRESSIVE);
