@@ -628,6 +628,8 @@ s32 migrate_to_neighbor(struct pick_ctx *ctx, struct cpdom_ctx *cpdc,
 				break;
 			}
 		}
+		if (cpu >= 0)
+			break;
 	}
 
 	return cpu;
