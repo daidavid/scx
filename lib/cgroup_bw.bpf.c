@@ -2214,6 +2214,22 @@ rearm_out:
 }
 
 /*
+ * Pick and claim an idle CPU to kick, preferring a fully idle core.
+ * A scheduler that tracks idle CPUs itself, with the builtin idle
+ * kfuncs disabled, must override this with a search of its own state.
+ */
+__weak
+s32 scx_cgroup_bw_pick_idle_cpu(const struct cpumask *cpus_allowed __arg_trusted)
+{
+	s32 idle_cpu;
+
+	idle_cpu = scx_bpf_pick_idle_cpu(cpus_allowed, SCX_PICK_IDLE_CORE);
+	if (idle_cpu == -EBUSY)
+		idle_cpu = scx_bpf_pick_idle_cpu(cpus_allowed, 0);
+	return idle_cpu;
+}
+
+/*
  * A handler function for the replenish timer.
  */
 static
@@ -2429,9 +2445,7 @@ int replenish_timerfn(void *map, int *key, struct bpf_timer *timer)
 		 * shortly anyway.
 		 */
 		online_mask = scx_bpf_get_online_cpumask();
-		idle_cpu = scx_bpf_pick_idle_cpu(online_mask, SCX_PICK_IDLE_CORE);
-		if (idle_cpu == -EBUSY)
-			idle_cpu = scx_bpf_pick_idle_cpu(online_mask, 0);
+		idle_cpu = scx_cgroup_bw_pick_idle_cpu(online_mask);
 		if (idle_cpu >= 0)
 			scx_bpf_kick_cpu(idle_cpu, SCX_KICK_IDLE);
 		scx_bpf_put_cpumask(online_mask);

@@ -130,6 +130,18 @@ int scx_cgroup_bw_put_aside(struct task_struct *p __arg_trusted, u64 taskc, u64 
 int scx_cgroup_bw_reenqueue(void);
 
 /**
+ * scx_cgroup_bw_pick_idle_cpu - Pick and claim an idle CPU to kick.
+ * @cpus_allowed: candidate CPUs
+ *
+ * Used by the replenish timer to guarantee ops.dispatch() runs after
+ * throttled tasks are released. The default relies on the builtin idle
+ * tracking; a scheduler that owns its idle-CPU state overrides it.
+ *
+ * Return the claimed CPU id, or -errno when no idle CPU is available.
+ */
+s32 scx_cgroup_bw_pick_idle_cpu(const struct cpumask *cpus_allowed __arg_trusted);
+
+/**
  * enum scx_cgroup_bw_cancel_flags - Flags for scx_cgroup_bw_cancel().
  * @SCX_CGROUP_BW_CANCEL_UNLINK: unlinks the task from its BTQ and keeps
  *   ownership active.
