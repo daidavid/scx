@@ -92,6 +92,17 @@ static void init_sys_stat_ctx(void)
 	WRITE_ONCE(sys_stat.last_update_clk, c->now);
 }
 
+/*
+ * Return whether @cpu currently runs its idle thread (PID 0).
+ * The caller must hold the BPF RCU read lock.
+ */
+static bool is_cpu_idle_now(s32 cpu)
+{
+	struct task_struct *curr = __COMPAT_scx_bpf_cpu_curr(cpu);
+
+	return curr && curr->pid == 0;
+}
+
 static void collect_sys_stat(void)
 {
 	struct sys_stat_ctx *c = &ctx;
@@ -528,6 +539,8 @@ static void collect_sys_stat(void)
 		struct bpf_cpumask *steady;
 		struct cpdom_ctx *cpu_cpdomc;
 		struct cpu_ctx *cpuc = get_cpu_ctx_id(cpu);
+		bool cpu_idle;
+
 		if (!cpuc) {
 			c->compute_total_wall = 0;
 			break;
@@ -559,6 +572,29 @@ static void collect_sys_stat(void)
 				bpf_cpumask_set_cpu(cpu, steady);
 			else
 				bpf_cpumask_clear_cpu(cpu, steady);
+		}
+
+		/*
+		 * Resync the CPU's bit in its compute domain's idle masks
+		 * from the CPU's current task. ops.update_idle() misses a
+		 * claimed CPU that re-enters idle without receiving a task,
+		 * and every transition while the scheduler is bypassed.
+		 * At worst the resync re-marks a CPU a waker just claimed,
+		 * placing one extra task on it.
+		 */
+		cpu_idle = cpuc->is_online && is_cpu_idle_now(cpu);
+		WRITE_ONCE(cpuc->in_idle, cpu_idle);
+		if (cpu_idle) {
+			set_cpu_idle_state(cpuc, cpu);
+
+			/*
+			 * An idle CPU with queued work missed its kick;
+			 * do not leave it sleeping on a runnable task.
+			 */
+			if (queued_on_cpu(cpuc))
+				scx_bpf_kick_cpu(cpu, SCX_KICK_IDLE);
+		} else {
+			clear_cpu_idle_state(cpuc, cpu);
 		}
 		bpf_rcu_read_unlock();
 

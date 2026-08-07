@@ -46,6 +46,23 @@ struct cpdom_ctx	cpdom_ctxs[LAVD_CPDOM_MAX_NR];
 /* online CPU mask for each compute domain */
 private(LAVD) struct bpf_cpumask cpdom_cpumask[LAVD_CPDOM_MAX_NR];
 
+/*
+ * Per-compute-domain idle CPU tracking, maintained by ops.update_idle().
+ * A compute domain never spans an LLC, so this splits the idle state per
+ * LLC: idle transitions and searches touch only the domain's cachelines
+ * instead of contending on a machine-wide mask.
+ *
+ * The builtin idle tracking is disabled, so these masks also arbitrate
+ * claims: a waker reserves a CPU by atomically clearing its bit. Bits go
+ * momentarily stale (see lavd_update_idle()); lavd_dispatch() and the
+ * sys_stat timer resync heal them.
+ */
+/* idle CPUs in each compute domain */
+private(LAVD) struct bpf_cpumask cpdom_idle_cpumask[LAVD_CPDOM_MAX_NR];
+
+/* fully idle cores in each compute domain */
+private(LAVD) struct bpf_cpumask cpdom_idle_smtmask[LAVD_CPDOM_MAX_NR];
+
 
 /*
  * Performance vs. CPU order (PCO) table

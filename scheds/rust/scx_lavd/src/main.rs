@@ -741,10 +741,12 @@ impl<'a> Scheduler<'a> {
             }
         }
 
+        // SCX_OPS_KEEP_BUILTIN_IDLE is deliberately not set: the scheduler
+        // owns all idle CPU tracking through the per-compute-domain idle
+        // masks maintained by ops.update_idle().
         skel.struct_ops.lavd_ops_mut().flags = *compat::SCX_OPS_ENQ_EXITING
             | *compat::SCX_OPS_ENQ_LAST
-            | *compat::SCX_OPS_ENQ_MIGRATION_DISABLED
-            | *compat::SCX_OPS_KEEP_BUILTIN_IDLE;
+            | *compat::SCX_OPS_ENQ_MIGRATION_DISABLED;
 
         if opts.partial {
             skel.struct_ops.lavd_ops_mut().flags |= *compat::SCX_OPS_SWITCH_PARTIAL;
