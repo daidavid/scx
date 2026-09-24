@@ -13,20 +13,22 @@ mod bpf_streams;
 pub use bpf_intf::*;
 
 mod cpu_order;
-#[cfg(test)]
 mod partition;
+mod partition_runtime;
 use scx_utils::init_libbpf_logging;
 mod stats;
 use std::ffi::CStr;
 use std::ffi::c_int;
 use std::mem;
 use std::mem::MaybeUninit;
+use std::path::PathBuf;
 use std::str;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::thread::ThreadId;
 use std::time::Duration;
+use std::time::Instant;
 
 use anyhow::Context;
 use anyhow::Result;
@@ -45,6 +47,7 @@ use libbpf_rs::ProgramInput;
 use libbpf_rs::skel::OpenSkel;
 use libbpf_rs::skel::Skel;
 use libc::c_char;
+use partition_runtime::PartitionRuntime;
 use plain::Plain;
 use scx_arena::ArenaLib;
 use scx_stats::prelude::*;
@@ -74,8 +77,8 @@ use tracing_subscriber::filter::EnvFilter;
 const SCHEDULER_NAME: &str = "scx_lavd";
 /// scx_lavd: Latency-criticality Aware Virtual Deadline (LAVD) scheduler
 ///
-/// The rust part is minimal. It processes command line options and logs out
-/// scheduling statistics. The BPF part makes all the scheduling decisions.
+/// The Rust part processes command line options, reports scheduling statistics,
+/// and optionally sizes soft partitions. BPF handles task placement and dispatch.
 /// See the more detailed overview of the LAVD design at main.bpf.c.
 #[derive(Debug, Parser)]
 struct Opts {
@@ -239,6 +242,18 @@ struct Opts {
     /// highly experimental feature.
     #[clap(long = "per-cpu-dsq", action = clap::ArgAction::SetTrue)]
     per_cpu_dsq: bool,
+
+    /// Configure demand-sized soft CPU partitions from a JSON file. Requires
+    /// --performance. Task comm prefixes select partitions; idle CPUs remain
+    /// available for borrowing. Cannot be combined with --per-cpu-dsq or a
+    /// nonzero --warm-cpu-us.
+    #[clap(
+        long,
+        value_name = "PATH",
+        requires = "performance",
+        conflicts_with = "per_cpu_dsq"
+    )]
+    partition_config: Option<PathBuf>,
 
     /// Enable CPU bandwidth control using cpu.max in cgroup v2.
     /// This is a highly experimental feature.
@@ -490,10 +505,20 @@ struct Scheduler<'a> {
     monitor_tid: Option<ThreadId>,
     stats_server: StatsServer<StatsReq, StatsRes>,
     mseq_id: u64,
+    partition: Option<PartitionRuntime>,
 }
 
 impl<'a> Scheduler<'a> {
     fn init(opts: &'a Opts, open_object: &'a mut MaybeUninit<OpenObject>) -> Result<Self> {
+        if opts.partition_config.is_some() && opts.warm_cpu_us != 0 {
+            anyhow::bail!("--partition-config requires --warm-cpu-us=0");
+        }
+        let partition_config = opts
+            .partition_config
+            .as_deref()
+            .map(partition::Config::load)
+            .transpose()?;
+
         if *NR_CPU_IDS > LAVD_CPU_ID_MAX as usize {
             panic!(
                 "Num possible CPU IDs ({}) exceeds maximum of ({})",
@@ -531,6 +556,9 @@ impl<'a> Scheduler<'a> {
         let order = CpuOrder::new(opts.topology.as_ref(), opts.no_use_em).unwrap();
         Self::init_cpus(&mut skel, &order);
         Self::init_cpdoms(&mut skel, &order);
+        let mut partition = partition_config
+            .map(|config| PartitionRuntime::new(config, &order, *NR_CPU_IDS))
+            .transpose()?;
 
         // When there are multiple domains, hook the execve() syscall family
         // to enable aggressive cross-domain migration when execve() is called.
@@ -540,6 +568,27 @@ impl<'a> Scheduler<'a> {
 
         // Initialize skel according to @opts.
         Self::init_globals(&mut skel, opts, &order, debug_level)?;
+
+        if let Some(controller) = &partition {
+            let rodata = skel.maps.rodata_data.as_mut().unwrap();
+            rodata.nr_partitions = controller.config.partitions.len() as u32;
+            for (rule, config) in rodata
+                .partition_rules
+                .iter_mut()
+                .zip(&controller.config.partitions)
+            {
+                rule.nr_prefixes = config.comm_prefixes.len() as u32;
+                for (target, prefix) in rule.prefixes.iter_mut().zip(&config.comm_prefixes) {
+                    target.fill(0);
+                    for (target, &byte) in target.iter_mut().zip(prefix.as_bytes()) {
+                        *target = byte as _;
+                    }
+                }
+            }
+            let bss = skel.maps.bss_data.as_mut().unwrap();
+            bss.partition_next_owner.fill(partition::UNASSIGNED);
+            bss.partition_next_owner[..controller.owners.len()].copy_from_slice(&controller.owners);
+        }
 
         // Mirror the cpu.max caps into rodata so the BPF admission gates match
         // the map sizes set just below.
@@ -564,6 +613,10 @@ impl<'a> Scheduler<'a> {
 
         // Attach.
         let struct_ops = Some(scx_ops_attach!(skel, lavd_ops)?);
+        if let Some(controller) = &mut partition {
+            let counters = partition_demand_snapshot(&skel);
+            controller.start(&counters, Instant::now());
+        }
         let stats_server = StatsServer::new(stats::server_data(*NR_CPU_IDS as u64)).launch()?;
 
         Ok(Self {
@@ -574,6 +627,7 @@ impl<'a> Scheduler<'a> {
             monitor_tid: None,
             stats_server,
             mseq_id: 0,
+            partition,
         })
     }
 
@@ -1079,11 +1133,15 @@ impl<'a> Scheduler<'a> {
         }
 
         while !shutdown.load(Ordering::Relaxed) && !self.exited() {
+            self.update_partitions()?;
             if autopower {
                 (autopower, profile) = self.update_power_profile(profile);
             }
 
-            match req_ch.recv_timeout(Duration::from_secs(1)) {
+            let timeout = self.partition.as_ref().map_or(Duration::from_secs(1), |p| {
+                p.until_update(Instant::now()).min(Duration::from_secs(1))
+            });
+            match req_ch.recv_timeout(timeout) {
                 Ok(req) => {
                     let res = self.stats_req_to_res(&req)?;
                     res_ch.send(res)?;
@@ -1103,6 +1161,49 @@ impl<'a> Scheduler<'a> {
         let _ = self.struct_ops.take();
         uei_report!(&self.skel, uei)
     }
+
+    fn update_partitions(&mut self) -> Result<()> {
+        let now = Instant::now();
+        if self
+            .partition
+            .as_ref()
+            .is_none_or(|p| !p.until_update(now).is_zero())
+        {
+            return Ok(());
+        }
+
+        let counters = partition_demand_snapshot(&self.skel);
+        let controller = self.partition.as_mut().unwrap();
+        if let Some(owners) = controller.update(&counters, now)? {
+            let bss = self.skel.maps.bss_data.as_mut().unwrap();
+            bss.partition_next_owner[..owners.len()].copy_from_slice(&owners);
+            let result = self
+                .skel
+                .progs
+                .soft_partition_apply
+                .test_run(ProgramInput::default())
+                .context("applying soft partition CPU ownership")?;
+            anyhow::ensure!(
+                result.return_value == 0,
+                "soft partition CPU update failed: {}",
+                result.return_value as i32
+            );
+            controller.applied(owners);
+        }
+        Ok(())
+    }
+}
+
+fn partition_demand_snapshot(skel: &BpfSkel<'_>) -> Vec<u64> {
+    skel.maps
+        .bss_data
+        .as_ref()
+        .unwrap()
+        .partition_demand
+        .iter()
+        // BPF updates these aligned u64 counters in shared mmap storage.
+        .map(|counter| unsafe { std::ptr::read_volatile(counter) })
+        .collect()
 }
 
 impl Drop for Scheduler<'_> {
