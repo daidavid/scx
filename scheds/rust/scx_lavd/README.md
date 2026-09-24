@@ -22,6 +22,21 @@ interactivity and reduce stuttering while playing games on Linux. Hence, this
 scheduler's typical use case involves highly interactive applications, such as
 gaming, which requires high throughput and low tail latencies.
 
+## Soft CPU partitions
+
+LAVD can optionally group threads by their `comm` prefixes and assign each group
+a preferred set of whole CPU cores. Assignments follow measured CPU demand;
+idle CPUs remain available to other groups. Enable this experimental mode with:
+
+```sh
+sudo scx_lavd --performance --partition-config examples/soft-partitions.json
+```
+
+Paths above are relative to this scheduler's directory. See
+[soft partitioning](docs/soft-partitioning.md) for configuration, scheduling
+semantics, limitations, and validation instructions. The default scheduler
+behavior is unchanged when `--partition-config` is omitted.
+
 ## Production Ready?
 
 Yes, `scx_lavd` should be performant across various CPU architectures. It creates
