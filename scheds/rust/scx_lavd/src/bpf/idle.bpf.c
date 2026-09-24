@@ -10,6 +10,7 @@
 #include "lavd.bpf.h"
 #include "util.bpf.h"
 #include "power.bpf.h"
+#include "partition.bpf.h"
 #include <lib/topology.h>
 #include <errno.h>
 #include <stdbool.h>
@@ -781,6 +782,11 @@ s32 pick_idle_cpu(struct pick_ctx *ctx, bool extend_ovrflw, bool *is_idle)
 		goto unlock_out;
 	}
 	/* NOTE: Now task @p is not a per-CPU task. */
+	if (nr_partitions) {
+		cpu = soft_partition_pick_cpu(ctx, is_idle);
+		if (cpu >= 0)
+			goto unlock_out;
+	}
 
 	/*
 	 * Warm-CPU preference: Prefer the previous CPU while its cache and TLB

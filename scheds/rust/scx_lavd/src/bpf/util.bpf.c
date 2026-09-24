@@ -7,6 +7,7 @@
 #include <scx/common.bpf.h>
 #include "intf.h"
 #include "lavd.bpf.h"
+#include "partition.bpf.h"
 #include "power.bpf.h"
 #include <errno.h>
 #include <stdbool.h>
@@ -395,6 +396,9 @@ u32 cpu_to_dsq(u32 cpu)
 __hidden
 bool queued_on_cpu(struct cpu_ctx *cpuc)
 {
+	if (nr_partitions && soft_partition_pending(cpuc->cpu_id))
+		return true;
+
 	if (scx_bpf_dsq_nr_queued(SCX_DSQ_LOCAL_ON | cpuc->cpu_id))
 		return true;
 
@@ -462,6 +466,14 @@ __hidden
 u64 get_target_dsq_id(struct task_struct *p, struct cpu_ctx *cpuc, task_ctx *taskc)
 {
 	struct cpdom_ctx *cpdomc;
+
+	if (nr_partitions) {
+		if (taskc->partition_id < nr_partitions &&
+		    !test_task_flag(taskc, LAVD_FLAG_IS_AFFINITIZED) &&
+		    !is_effectively_pinned(taskc))
+			return partition_to_dsq(taskc->partition_id);
+		return cpu_to_dsq(cpuc->cpu_id);
+	}
 
 	/*
 	 * Route effectively pinned tasks (permanent pinning or

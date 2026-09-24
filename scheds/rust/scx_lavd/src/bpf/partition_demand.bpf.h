@@ -84,7 +84,7 @@ static __always_inline void soft_partition_publish(task_ctx *taskc, u64 now)
 	taskc->partition_sleep_ns = 0;
 }
 
-/* Call only when the task is not running, after accounting its old run. */
+/* Account the old run first, including when reclassifying at slice refill. */
 static __always_inline void soft_partition_reclassify(task_ctx *taskc,
 						     u32 new_id, u64 now)
 {

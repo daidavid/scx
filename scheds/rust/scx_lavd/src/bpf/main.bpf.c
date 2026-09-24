@@ -188,6 +188,7 @@
 #include "util.bpf.h"
 #include "power.bpf.h"
 #include "partition_demand.bpf.h"
+#include "partition.bpf.h"
 #include <errno.h>
 #include <stdbool.h>
 #include <bpf/bpf_core_read.h>
@@ -677,8 +678,16 @@ static void update_stat_for_refill(struct task_struct *p,
 					   taskc->acc_runtime_invr);
 }
 
-static bool can_direct_dispatch(struct cpu_ctx *cpuc, bool is_cpu_idle)
+static bool can_direct_dispatch(struct cpu_ctx *cpuc, task_ctx *taskc,
+				bool is_cpu_idle)
 {
+	/* Busy-CPU FIFO bypass would let borrowers skip the owner's queue. */
+	if (nr_partitions)
+		return is_cpu_idle && !queued_on_cpu(cpuc) &&
+		       (taskc->partition_id >= nr_partitions ||
+			!scx_bpf_dsq_nr_queued(partition_to_dsq(taskc->partition_id))) &&
+		       !is_rt_or_dl_task_running(cpuc->cpu_id);
+
 	/*
 	 * An idle CPU with nothing queued cannot be congested --
 	 * queued_on_cpu() covers every DSQ that is_cpu_congested()
@@ -833,6 +842,8 @@ s32 BPF_STRUCT_OPS(lavd_select_cpu, struct task_struct *p, s32 prev_cpu,
 
 	if (!ictx.taskc || !ictx.cpuc_cur)
 		return prev_cpu;
+	if (nr_partitions)
+		soft_partition_refresh(p, ictx.taskc);
 
 	/*
 	 * Check whether it is a synchronous wake-up to boost
@@ -888,7 +899,7 @@ s32 BPF_STRUCT_OPS(lavd_select_cpu, struct task_struct *p, s32 prev_cpu,
 			goto out;
 		}
 
-		if (can_direct_dispatch(cpuc, true)) {
+		if (can_direct_dispatch(cpuc, ictx.taskc, true)) {
 			/*
 			 * The direct-dispatch path bypasses ops.enqueue(), so
 			 * the throttle check there is never reached.  Skip the
@@ -928,6 +939,8 @@ void BPF_STRUCT_OPS(lavd_enqueue, struct task_struct *p, u64 enq_flags)
 		return;
 	}
 	task_cpu = scx_bpf_task_cpu(p);
+	if (nr_partitions)
+		soft_partition_refresh(p, taskc);
 
 	/*
 	 * A reenqueue (SCX_ENQ_REENQ) means the task was already placed once
@@ -1099,7 +1112,7 @@ void BPF_STRUCT_OPS(lavd_enqueue, struct task_struct *p, u64 enq_flags)
 	 * When pinned_slice_ns is enabled, pinned tasks always use per-CPU DSQ
 	 * to enable vtime comparison across DSQs during dispatch.
 	 */
-	if (can_direct_dispatch(cpuc, is_idle)) {
+	if (can_direct_dispatch(cpuc, taskc, is_idle)) {
 		reset_task_flag(taskc, LAVD_FLAG_WARM_CPU);
 		scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | cpu, p->scx.slice,
 				   enq_flags);
@@ -1293,6 +1306,12 @@ void consume_prev(struct task_struct *prev, task_ctx *taskc_prev, struct cpu_ctx
 	 * resolved on its next subject op.
 	 */
 	update_stat_for_refill(prev, taskc_prev, cpuc);
+	if (nr_partitions) {
+		/* No subject-task kfuncs: account first, then observe comm/affinity. */
+		soft_partition_refresh(prev, taskc_prev);
+		if (!soft_partition_can_refill(cpuc, taskc_prev))
+			return;
+	}
 	if (enable_cpu_bw &&
 	    scx_cgroup_bw_throttled(NULL, (u64)taskc_prev) == -EAGAIN)
 		return;
@@ -1441,6 +1460,15 @@ void BPF_STRUCT_OPS(lavd_dispatch, s32 cpu, struct task_struct *prev)
 	 */
 	if (enable_cpu_bw && (ret = scx_cgroup_bw_reenqueue())) {
 		scx_bpf_error("Failed to reenqueue backlogged tasks: %d", ret);
+	}
+
+	if (nr_partitions) {
+		if (prev && (prev->scx.flags & SCX_TASK_QUEUED))
+			taskc_prev = get_task_ctx(prev);
+		if (!soft_partition_consume(cpuc, taskc_prev) &&
+		    soft_partition_can_refill(cpuc, taskc_prev))
+			consume_prev(prev, taskc_prev, cpuc);
+		return;
 	}
 
 	/*
@@ -1755,6 +1783,8 @@ void BPF_STRUCT_OPS(lavd_running, struct task_struct *p)
 	 * Update task statistics
 	 */
 	update_stat_for_running(p, taskc, cpuc, now);
+	if (nr_partitions)
+		soft_partition_running(taskc);
 
 	/*
 	 * Update this CPU's performance target from its utilization.
@@ -1792,6 +1822,9 @@ void BPF_STRUCT_OPS(lavd_tick, struct task_struct *p)
 
 	now = scx_bpf_now();
 	account_task_runtime(p, taskc, cpuc, now, true);
+	/* The kernel can retain a solo task without an enqueue/refill callback. */
+	if (nr_partitions)
+		soft_partition_refresh(p, taskc);
 
 	/*
 	 * Under the CPU bandwidth control with cpu.max, check if the cgroup
@@ -2231,12 +2264,15 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(lavd_init_task, struct task_struct *p,
 
 	/* Per-CPU warmth is task+CPU private -- never inherit it. */
 	soft_partition_reset(taskc);
+	WRITE_ONCE(taskc->partition_comm_valid, false);
 	taskc->cpu_heat = 0;
 	taskc->last_stopping_clk = scx_bpf_now();
 
 	bpf_rcu_read_lock();
 	set_affinity_flags(taskc, p->cpus_ptr);
 	bpf_rcu_read_unlock();
+	if (nr_partitions)
+		soft_partition_refresh(p, taskc);
 
 	if (is_ksoftirqd(p))
 		set_task_flag(taskc, LAVD_FLAG_KSOFTIRQD);
@@ -2789,6 +2825,8 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(lavd_init)
 		if (err)
 			return err;
 	}
+	if ((err = soft_partition_init()))
+		return err;
 
 	/*
 	 * Initialize the last update clock and the update timer to track

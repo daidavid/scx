@@ -7,6 +7,7 @@
 #include <scx/common.bpf.h>
 #include "intf.h"
 #include "lavd.bpf.h"
+#include "partition.bpf.h"
 #include "util.bpf.h"
 #include "power.bpf.h"
 #include <errno.h>
@@ -97,6 +98,17 @@ static void collect_sys_stat(void)
 	struct cpdom_ctx *cpdomc;
 	u64 cpdom_id, compute_wall = 1;
 	int cpu;
+
+	/* Global partition queues contribute once to LAVD's backlog estimate. */
+	if (nr_partitions) {
+		int id;
+
+		bpf_for(id, 0, LAVD_PARTITION_MAX) {
+			if (id >= nr_partitions)
+				break;
+			c->nr_queued_task += scx_bpf_dsq_nr_queued(partition_to_dsq(id));
+		}
+	}
 
 	/*
 	 * Collect statistics for each compute domain.
