@@ -6098,6 +6098,7 @@ dependencies = [
  "scx_stats_derive",
  "scx_utils",
  "serde",
+ "serde_json",
  "static_assertions",
  "tracing",
  "tracing-subscriber",

@@ -13,6 +13,8 @@ mod bpf_streams;
 pub use bpf_intf::*;
 
 mod cpu_order;
+#[cfg(test)]
+mod partition;
 use scx_utils::init_libbpf_logging;
 mod stats;
 use std::ffi::CStr;
