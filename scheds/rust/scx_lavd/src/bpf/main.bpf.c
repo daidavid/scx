@@ -187,12 +187,17 @@
 #include "lavd.bpf.h"
 #include "util.bpf.h"
 #include "power.bpf.h"
+#include "partition_demand.bpf.h"
 #include <errno.h>
 #include <stdbool.h>
 #include <bpf/bpf_core_read.h>
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_tracing.h>
 #include <lib/cgroup.h>
+
+/* Zero keeps soft partition accounting off until configured by userspace. */
+const volatile u32 nr_partitions;
+u64 partition_demand[LAVD_PARTITION_MAX];
 
 char _license[] SEC("license") = "GPL";
 
@@ -593,6 +598,7 @@ static void account_task_runtime(struct task_struct *p,
 	}
 
 	taskc->acc_runtime_wall += task_time_wall;
+	soft_partition_account(taskc, task_time_wall, now);
 	taskc->acc_runtime_invr += task_time_invr;
 	taskc->svc_time_iwgt += task_time_iwgt;
 	taskc->last_measured_wall_clk = now;
@@ -1597,6 +1603,7 @@ void BPF_STRUCT_OPS(lavd_runnable, struct task_struct *p, u64 enq_flags)
 	}
 	WRITE_ONCE(p_taskc->acc_runtime_wall, 0);
 	WRITE_ONCE(p_taskc->acc_runtime_invr, 0);
+	soft_partition_runnable(p_taskc, scx_bpf_now());
 
 	/*
 	 * When a task @p is wakened up, the wake frequency of its waker task
@@ -1825,6 +1832,7 @@ void BPF_STRUCT_OPS(lavd_stopping, struct task_struct *p, bool runnable)
 	}
 
 	update_stat_for_stopping(p, taskc, cpuc);
+	soft_partition_stopping(taskc, scx_bpf_now());
 }
 
 void BPF_STRUCT_OPS(lavd_quiescent, struct task_struct *p, u64 deq_flags)
@@ -1880,6 +1888,7 @@ void BPF_STRUCT_OPS(lavd_quiescent, struct task_struct *p, u64 deq_flags)
 
 	/* mark the task as sleeping in the duty-cycle ravg */
 	now = scx_bpf_now();
+	soft_partition_quiescent(taskc, now);
 	ravg_accumulate_arena(&taskc->avg_util_ravg, 0, now, LAVD_RAVG_HALFLIFE_NS);
 	taskc->util_est = (u32)(ravg_read_arena(&taskc->avg_util_ravg, now,
 						LAVD_RAVG_HALFLIFE_NS) >> RAVG_FRAC_BITS);
@@ -2221,6 +2230,7 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(lavd_init_task, struct task_struct *p,
 	taskc->cgrp_id = args->cgroup->kn->id;
 
 	/* Per-CPU warmth is task+CPU private -- never inherit it. */
+	soft_partition_reset(taskc);
 	taskc->cpu_heat = 0;
 	taskc->last_stopping_clk = scx_bpf_now();
 

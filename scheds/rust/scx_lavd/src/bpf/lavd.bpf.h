@@ -260,6 +260,15 @@ struct task_ctx {
 	/* --- per-CPU warmth (cache/TLB state) --- */
 	u64	last_stopping_clk;	/* when cpu_heat was last integrated (task stopped) */
 	u16	cpu_heat;		/* residence-integrated heat for cpu_id [0, LAVD_SCALE] */
+
+	/* Soft partition demand: queue wait must not reduce CPU demand. */
+	u64	partition_window_at;
+	u64	partition_run_ns;
+	u64	partition_sleep_ns;
+	u64	partition_sleep_at;
+	u32	partition_id;
+	u32	partition_demand_est;
+	u32	partition_account_id;
 } __attribute__((aligned(CACHELINE_SIZE)));
 
 /*

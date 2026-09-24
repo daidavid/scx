@@ -37,11 +37,19 @@ enum {
 	LAVD_CPDOM_MAX_DIST		= 3,  /* maximum distance from one compute domain to another */
 
 	LAVD_PCO_STATE_MAX		= 11, /* maximum number of performance vs. CPU order states */
+	LAVD_PARTITION_MAX		= 16,
+	LAVD_PARTITION_PREFIX_MAX	= 8,
 
 	LAVD_STATUS_STR_LEN		= 4,  /* {LR: Latency-critical, Regular}
 						 {HI: performance-Hungry, performance-Insensitive}
 						 {BT: Big, liTtle}
 						 {EG: Eligible, Greedy} */
+};
+
+/* Ordered comm-prefix alternatives. Partition zero is the catch-all. */
+struct partition_rule {
+	u32 nr_prefixes;
+	char prefixes[LAVD_PARTITION_PREFIX_MAX][TASK_COMM_LEN];
 };
 
 /*
