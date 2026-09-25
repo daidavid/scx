@@ -3,6 +3,7 @@
 #include "intf.h"
 #include "lavd.bpf.h"
 #include "util.bpf.h"
+#include "partition.bpf.h"
 #include <errno.h>
 #include <stdbool.h>
 #include <bpf/bpf_core_read.h>
@@ -356,6 +357,14 @@ void try_find_and_kick_victim_cpu(struct task_struct *p,
 	struct cpu_ctx *cpuc_cur = NULL;
 	u64 now, duration_wall, new_slice_wall = 0;
 
+	if (nr_partitions) {
+		if (preferred_cpu >= 0 &&
+		    !soft_partition_cpu_owned(taskc, preferred_cpu))
+			preferred_cpu = -ENOENT;
+		if (soft_partition_kick_guest(taskc, preferred_cpu))
+			return;
+	}
+
 	/*
 	 * Don't even try to perform expensive preemption for greedy tasks.
 	 * And, check if it is worth to try to kick other CPU.
@@ -419,7 +428,10 @@ void try_find_and_kick_victim_cpu(struct task_struct *p,
 	if (!cpdomc || !cd_cpumask || !cpumask)
 		return;
 
-	bpf_cpumask_and(cpumask, cast_mask(cd_cpumask), p->cpus_ptr);
+	if (nr_partitions && taskc->partition_id < nr_partitions)
+		soft_partition_preempt_mask(p, taskc, cpumask);
+	else
+		bpf_cpumask_and(cpumask, cast_mask(cd_cpumask), p->cpus_ptr);
 
 	/*
 	 * Find a victim CPU among CPUs that run lower-priority tasks.
@@ -431,6 +443,9 @@ void try_find_and_kick_victim_cpu(struct task_struct *p,
 	 */
 	if (cpuc_victim) {
 kick_out:
+		/* A concurrently changed grant must not preempt its new owner. */
+		if (nr_partitions && !soft_partition_cpu_owned(taskc, cpuc_victim->cpu_id))
+			return;
 		ask_cpu_yield_after(cpuc_victim, new_slice_wall);
 
 		if (cpuc_cur || (cpuc_cur = get_cpu_ctx()))

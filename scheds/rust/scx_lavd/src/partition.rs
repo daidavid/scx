@@ -278,7 +278,8 @@ impl Config {
 /// Thus a quota change moves only cores that must move. When a partition must
 /// donate cores, retain those with the most previously assigned logical CPUs.
 /// New cores and released cores fill remaining quotas in topology order.
-pub fn assign_cores(cores: &[Vec<usize>], demand: &[u64], previous: &[u32]) -> Result<Vec<u32>> {
+#[cfg(test)]
+fn assign_cores(cores: &[Vec<usize>], demand: &[u64], previous: &[u32]) -> Result<Vec<u32>> {
     assign_entries(
         cores,
         demand,

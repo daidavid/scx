@@ -99,17 +99,6 @@ static void collect_sys_stat(void)
 	u64 cpdom_id, compute_wall = 1;
 	int cpu;
 
-	/* Global partition queues contribute once to LAVD's backlog estimate. */
-	if (nr_partitions) {
-		int id;
-
-		bpf_for(id, 0, LAVD_PARTITION_MAX) {
-			if (id >= nr_partitions)
-				break;
-			c->nr_queued_task += scx_bpf_dsq_nr_queued(partition_to_dsq(id));
-		}
-	}
-
 	/*
 	 * Collect statistics for each compute domain.
 	 */
@@ -744,6 +733,9 @@ static void calc_sys_stat(void)
 	bpf_for(cpdom_id, 0, nr_cpdoms) {
 		struct cpdom_ctx *cpdomc;
 
+		/* Grant-mode thresholds use actual service CPUs, not queue location. */
+		if (nr_partitions)
+			break;
 		if (cpdom_id >= LAVD_CPDOM_MAX_NR)
 			break;
 
@@ -793,6 +785,7 @@ static int do_update_sys_stat(void)
 {
 	init_sys_stat_ctx();
 	collect_sys_stat();
+	soft_partition_update_service();
 	calc_sys_stat();
 
 	return 0;
@@ -833,7 +826,8 @@ int update_sys_stat(void)
 	/*
 	 * Plan cross-domain task migration.
 	 */
-	if (nr_cpdoms > 1)
+	/* Physical-domain equalization would undo CPU grants. */
+	if (!nr_partitions && nr_cpdoms > 1)
 		plan_x_cpdom_migration();
 
 	return 0;

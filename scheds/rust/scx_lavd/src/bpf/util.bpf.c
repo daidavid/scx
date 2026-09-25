@@ -466,14 +466,7 @@ __hidden
 u64 get_target_dsq_id(struct task_struct *p, struct cpu_ctx *cpuc, task_ctx *taskc)
 {
 	struct cpdom_ctx *cpdomc;
-
-	if (nr_partitions) {
-		if (taskc->partition_id < nr_partitions &&
-		    !test_task_flag(taskc, LAVD_FLAG_IS_AFFINITIZED) &&
-		    !is_effectively_pinned(taskc))
-			return partition_to_dsq(taskc->partition_id);
-		return cpu_to_dsq(cpuc->cpu_id);
-	}
+	u32 cpdom_id = cpuc->cpdom_id;
 
 	/*
 	 * Route effectively pinned tasks (permanent pinning or
@@ -484,13 +477,18 @@ u64 get_target_dsq_id(struct task_struct *p, struct cpu_ctx *cpuc, task_ctx *tas
 	if (per_cpu_dsq || (pinned_slice_ns && is_effectively_pinned(taskc)))
 		return cpu_to_dsq(cpuc->cpu_id);
 
-	cpdomc = MEMBER_VPTR(cpdom_ctxs, [cpuc->cpdom_id]);
+	/* BTQ callbacks can observe affinity changes before cached flags refresh. */
+	if (nr_partitions && taskc->partition_id < nr_partitions &&
+	    !is_migration_disabled(p) &&
+	    bpf_cpumask_weight(p->cpus_ptr) == nr_cpu_ids)
+		cpdom_id = soft_partition_home(taskc, cpdom_id);
+	cpdomc = MEMBER_VPTR(cpdom_ctxs, [cpdom_id]);
 	if (cpdomc &&
 	    preemption_vulnerability(taskc->normalized_lat_cri,
 				    taskc->util_est) >= cpdomc->vuln_thresh)
-		return cpdom_to_dsq(cpuc->cpdom_id);
+		return cpdom_to_dsq(cpdom_id);
 
-	return cpdom_to_turb_dsq(cpuc->cpdom_id);
+	return cpdom_to_turb_dsq(cpdom_id);
 }
 
 /*

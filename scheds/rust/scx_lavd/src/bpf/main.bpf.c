@@ -335,7 +335,8 @@ static u64 calc_time_slice(task_ctx *taskc, struct cpu_ctx *cpuc)
 	 * we do not boost the task's time slice to avoid delaying the pinned
 	 * task that cannot be run on another CPU.
 	 */
-	if (!no_slice_boost && !cpuc->nr_pinned_tasks &&
+	/* Regular slices bound grant reclamation and physical-queue rescue. */
+	if (!nr_partitions && !no_slice_boost && !cpuc->nr_pinned_tasks &&
 	    (taskc->avg_runtime_wall >= sys_stat.slice_wall)) {
 		/*
 		 * When the system is not heavily loaded, so it can serve all
@@ -684,8 +685,7 @@ static bool can_direct_dispatch(struct cpu_ctx *cpuc, task_ctx *taskc,
 	/* Busy-CPU FIFO bypass would let borrowers skip the owner's queue. */
 	if (nr_partitions)
 		return is_cpu_idle && !queued_on_cpu(cpuc) &&
-		       (taskc->partition_id >= nr_partitions ||
-			!scx_bpf_dsq_nr_queued(partition_to_dsq(taskc->partition_id))) &&
+		       !soft_partition_group_pending(taskc->partition_id) &&
 		       !is_rt_or_dl_task_running(cpuc->cpu_id);
 
 	/*
@@ -931,6 +931,7 @@ void BPF_STRUCT_OPS(lavd_enqueue, struct task_struct *p, u64 enq_flags)
 	bool is_idle = false;
 	task_ctx *taskc;
 	u64 dsq_id;
+	u32 queued_cpdom;
 
 	cpuc_cur = get_cpu_ctx();
 	taskc = get_task_ctx_curcpu(p, cpuc_cur);
@@ -964,10 +965,11 @@ void BPF_STRUCT_OPS(lavd_enqueue, struct task_struct *p, u64 enq_flags)
 		}
 
 		/*
-		 * The task has not run since, so its slice, CPU choice, and
-		 * queued-load accounting are still valid -- reuse the cached
-		 * suggested_cpu_id and reinsert into the previously chosen
-		 * cpdom DSQ, never the local DSQ it was just drained from.
+		 * The task has not run since, so its slice and validated cached
+		 * CPU choice can be reused. Reinsert into
+		 * a shared DSQ, never the local DSQ it was just drained from.
+		 * Grant mode can change the queue home after reclassification,
+		 * so its queued-load attribution is transferred below.
 		 */
 		cpu = taskc->suggested_cpu_id;
 		/*
@@ -1006,6 +1008,14 @@ void BPF_STRUCT_OPS(lavd_enqueue, struct task_struct *p, u64 enq_flags)
 		p->scx.dsq_vtime = calc_when_to_run(p, taskc);
 
 		dsq_id = get_target_dsq_id(p, cpuc, taskc);
+		if (nr_partitions) {
+			unaccount_queued_load(taskc);
+			unaccount_queued_load_pcpu(taskc);
+			account_queued_load(taskc, dsq_type(dsq_id) == LAVD_DSQ_TYPE_CPU ?
+						 cpuc->cpdom_id : dsq_to_cpdom(dsq_id));
+			if (dsq_type(dsq_id) == LAVD_DSQ_TYPE_CPU)
+				account_queued_load_pcpu(taskc, dsq_to_cpu(dsq_id));
+		}
 		scx_bpf_dsq_insert_vtime(p, dsq_id, p->scx.slice,
 					 p->scx.dsq_vtime, enq_flags);
 		goto kick_cpu_out;
@@ -1112,6 +1122,7 @@ void BPF_STRUCT_OPS(lavd_enqueue, struct task_struct *p, u64 enq_flags)
 	 * When pinned_slice_ns is enabled, pinned tasks always use per-CPU DSQ
 	 * to enable vtime comparison across DSQs during dispatch.
 	 */
+	queued_cpdom = cpuc->cpdom_id;
 	if (can_direct_dispatch(cpuc, taskc, is_idle)) {
 		reset_task_flag(taskc, LAVD_FLAG_WARM_CPU);
 		scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | cpu, p->scx.slice,
@@ -1132,8 +1143,10 @@ void BPF_STRUCT_OPS(lavd_enqueue, struct task_struct *p, u64 enq_flags)
 					 p->scx.dsq_vtime, enq_flags);
 		if (dsq_type(dsq_id) == LAVD_DSQ_TYPE_CPU)
 			account_queued_load_pcpu(taskc, dsq_to_cpu(dsq_id));
+		else
+			queued_cpdom = dsq_to_cpdom(dsq_id);
 	}
-	account_queued_load(taskc, cpuc->cpdom_id);
+	account_queued_load(taskc, queued_cpdom);
 
 kick_cpu_out:
 	/*
@@ -1242,7 +1255,8 @@ int enqueue_cb(struct task_struct __arg_trusted *p, task_ctx *taskc)
 	 */
 	dsq_id = get_target_dsq_id(p, cpuc, taskc);
 	scx_bpf_dsq_insert_vtime(p, dsq_id, p->scx.slice, p->scx.dsq_vtime, 0);
-	account_queued_load(taskc, cpuc->cpdom_id);
+	account_queued_load(taskc, dsq_type(dsq_id) == LAVD_DSQ_TYPE_CPU ?
+				 cpuc->cpdom_id : dsq_to_cpdom(dsq_id));
 	if (dsq_type(dsq_id) == LAVD_DSQ_TYPE_CPU)
 		account_queued_load_pcpu(taskc, dsq_to_cpu(dsq_id));
 
@@ -1834,6 +1848,11 @@ void BPF_STRUCT_OPS(lavd_tick, struct task_struct *p)
 		preempt_at_tick(p, cpuc);
 		return;
 	}
+	if (nr_partitions && !soft_partition_cpu_owned(taskc, cpuc->cpu_id) &&
+	    soft_partition_pending(cpuc->cpu_id)) {
+		preempt_at_tick(p, cpuc);
+		return;
+	}
 
 	/*
 	 * If there is a pinned task on this CPU, shrink its time slice.
@@ -2265,6 +2284,7 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(lavd_init_task, struct task_struct *p,
 	/* Per-CPU warmth is task+CPU private -- never inherit it. */
 	soft_partition_reset(taskc);
 	WRITE_ONCE(taskc->partition_comm_valid, false);
+	WRITE_ONCE(taskc->partition_home_cpdom, LAVD_CPDOM_MAX_NR);
 	taskc->cpu_heat = 0;
 	taskc->last_stopping_clk = scx_bpf_now();
 

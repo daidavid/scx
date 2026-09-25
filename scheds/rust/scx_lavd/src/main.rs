@@ -244,9 +244,11 @@ struct Opts {
     per_cpu_dsq: bool,
 
     /// Configure demand-sized soft CPU partitions from a JSON file. Requires
-    /// --performance. Task comm prefixes select partitions; idle CPUs remain
-    /// available for borrowing. Cannot be combined with --per-cpu-dsq or a
-    /// nonzero --warm-cpu-us.
+    /// --performance and one existing LLC or virtual LLC queue home per
+    /// partition. Task comm prefixes select partitions; independently sized
+    /// CPU grants preserve whole cores by default (JSON granularity "cpu"
+    /// allows splitting SMT). Idle CPUs remain available for borrowing.
+    /// Cannot be combined with --per-cpu-dsq or a nonzero --warm-cpu-us.
     #[clap(
         long,
         value_name = "PATH",
@@ -572,6 +574,15 @@ impl<'a> Scheduler<'a> {
         if let Some(controller) = &partition {
             let rodata = skel.maps.rodata_data.as_mut().unwrap();
             rodata.nr_partitions = controller.config.partitions.len() as u32;
+            rodata.partition_cpu_granularity =
+                controller.config.granularity == partition::Granularity::Cpu;
+            anyhow::ensure!(
+                controller.cpdom_owners.len() <= rodata.partition_cpdom_owner.len(),
+                "too many compute domains for soft partition queue homes"
+            );
+            rodata.partition_cpdom_owner.fill(partition::UNASSIGNED);
+            rodata.partition_cpdom_owner[..controller.cpdom_owners.len()]
+                .copy_from_slice(&controller.cpdom_owners);
             for (rule, config) in rodata
                 .partition_rules
                 .iter_mut()
@@ -587,7 +598,8 @@ impl<'a> Scheduler<'a> {
             }
             let bss = skel.maps.bss_data.as_mut().unwrap();
             bss.partition_next_owner.fill(partition::UNASSIGNED);
-            bss.partition_next_owner[..controller.owners.len()].copy_from_slice(&controller.owners);
+            bss.partition_next_owner[..controller.owners.len()]
+                .copy_from_slice(&controller.staged_owners(&controller.owners));
         }
 
         // Mirror the cpu.max caps into rodata so the BPF admission gates match
@@ -1159,7 +1171,26 @@ impl<'a> Scheduler<'a> {
 
         bpf_streams::dump_bpf_streams(&mut self.skel);
         let _ = self.struct_ops.take();
+        self.log_partition_service();
         uei_report!(&self.skel, uei)
+    }
+
+    fn log_partition_service(&self) {
+        let Some(controller) = &self.partition else {
+            return;
+        };
+        let bss = self.skel.maps.bss_data.as_ref().unwrap();
+        for (id, partition) in controller.config.partitions.iter().enumerate() {
+            // These are cumulative BPF counters in shared mmap storage.
+            let owned = unsafe { std::ptr::read_volatile(&bss.partition_owner_dispatches[id]) };
+            let remote = unsafe { std::ptr::read_volatile(&bss.partition_remote_dispatches[id]) };
+            info!(
+                "Soft partition service {:?}: owned_dispatch={}, remote_home_dispatch={}",
+                partition.name, owned, remote,
+            );
+        }
+        let rescues = unsafe { std::ptr::read_volatile(&bss.partition_native_rescues) };
+        info!("Soft partition native rescues: {}", rescues);
     }
 
     fn update_partitions(&mut self) -> Result<()> {
@@ -1176,7 +1207,8 @@ impl<'a> Scheduler<'a> {
         let controller = self.partition.as_mut().unwrap();
         if let Some(owners) = controller.update(&counters, now)? {
             let bss = self.skel.maps.bss_data.as_mut().unwrap();
-            bss.partition_next_owner[..owners.len()].copy_from_slice(&owners);
+            bss.partition_next_owner[..owners.len()]
+                .copy_from_slice(&controller.staged_owners(&owners));
             let result = self
                 .skel
                 .progs

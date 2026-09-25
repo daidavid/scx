@@ -54,7 +54,6 @@ enum {
 	LAVD_DSQ_NR_TYPES		= 4,
 	LAVD_DSQ_TYPE_CPDOM		= 1,
 	LAVD_DSQ_TYPE_CPDOM_TURB		= 2,
-	LAVD_DSQ_TYPE_PARTITION		= 3,
 	LAVD_DSQ_TYPE_CPU		= 0,
 };
 
@@ -270,6 +269,7 @@ struct task_ctx {
 	u32	partition_id;
 	u32	partition_demand_est;
 	u32	partition_account_id;
+	u32	partition_home_cpdom;
 	char	partition_comm[TASK_COMM_LEN];
 	bool	partition_comm_valid;
 } __attribute__((aligned(CACHELINE_SIZE)));
@@ -695,7 +695,7 @@ void task_update_cpu_warmth(task_ctx __arg_arena *taskc, struct cpu_ctx *cpuc,
 
 static __always_inline bool use_per_cpu_dsq(void)
 {
-	return per_cpu_dsq || pinned_slice_ns || warm_cpu_ns || nr_partitions;
+	return per_cpu_dsq || pinned_slice_ns || warm_cpu_ns;
 }
 
 static __always_inline  bool is_per_cpu_dsq_migratable(void)
@@ -712,7 +712,7 @@ static __always_inline  bool is_per_cpu_dsq_migratable(void)
 
 static __always_inline bool use_cpdom_dsq(void)
 {
-	return !per_cpu_dsq && !nr_partitions;
+	return !per_cpu_dsq;
 }
 
 static __always_inline bool is_turbulent_cpu(struct cpu_ctx *cpuc)
