@@ -25,14 +25,19 @@ gaming, which requires high throughput and low tail latencies.
 ## Soft CPU partitions
 
 LAVD can optionally group threads by their `comm` prefixes and assign each group
-a preferred set of whole CPU cores. Assignments follow measured CPU demand;
-idle CPUs remain available to other groups. Enable this experimental mode with:
+preferred CPU service grants backed by fixed native LLC/vLLC queue homes.
+Grants follow measured CPU demand; idle CPUs remain available to other groups.
+Whole cores are the default, with optional logical-CPU granularity. Each group
+needs an existing LLC or virtual LLC home, including the default group. Enable this experimental mode with:
 
 ```sh
-sudo scx_lavd --performance --partition-config examples/soft-partitions.json
+sudo scx_lavd --performance --virt-llc=2-2 \
+  --partition-config examples/soft-partitions.json
 ```
 
-Paths above are relative to this scheduler's directory. See
+The virtual-LLC example assumes six homogeneous physical cores in one LLC
+and provides three homes.
+Choose a topology appropriate for your machine. Paths above are relative to this scheduler's directory. See
 [soft partitioning](docs/soft-partitioning.md) for configuration, scheduling
 semantics, limitations, and validation instructions. The default scheduler
 behavior is unchanged when `--partition-config` is omitted.

@@ -4,5 +4,6 @@
     { "name": "workers", "comm_prefixes": ["Worker", "Job"] },
     { "name": "default", "comm_prefixes": [] }
   ],
-  "interval_ms": 1000
+  "interval_ms": 1000,
+  "granularity": "core"
 }

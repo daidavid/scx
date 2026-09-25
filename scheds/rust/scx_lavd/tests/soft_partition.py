@@ -9,9 +9,10 @@ Workers alone enroll in SCHED_EXT. The test creates its own configuration and
 retains logs/results in a new temporary directory (or --output). It does not
 change CPU online state, frequency policy, cgroups, or host affinity. It checks
 progress and placement, not throughput or latency guarantees. A full online
-CPU affinity and at least three online physical cores are required. To bound
-test load, hosts above 32 online logical CPUs are skipped. The zero-owner test
-is skipped above 14 cores because configuration supports at most 16 partitions.
+CPU affinity and at least six online physical cores are required. To bound
+test load, hosts above 32 online logical CPUs are skipped. The startup virtual
+LLC configuration must provide at least three queue homes. The default 2-2
+split does so on the six-core homogeneous test VM; --virt-llc can override it.
 """
 import argparse
 import ctypes
@@ -99,12 +100,13 @@ def run_group(specs, seconds):
             conn.close()
 
 
-def session(binary, config, output, cases):
+def session(binary, config, output, cases, extra_args=()):
     assert STATE.read_text().strip() == 'disabled'
     output.mkdir(parents=True, exist_ok=False)
     log = (output/'scheduler.log').open('w')
     scheduler = subprocess.Popen([binary, '--partial', '--performance', '--no-freq-scaling',
-                                  '--warm-cpu-us=0', '--partition-config', str(config)],
+                                  '--warm-cpu-us=0', '--partition-config', str(config),
+                                  *extra_args],
                                  stdout=log, stderr=subprocess.STDOUT)
     results = {'cases': {}}
     try:
@@ -135,6 +137,34 @@ def session(binary, config, output, cases):
     return results
 
 
+def reject_config(binary, config, output, extra_args):
+    """An impossible home layout must fail before scheduler attachment."""
+    assert STATE.read_text().strip() == 'disabled'
+    result = subprocess.run([binary, '--partial', '--performance', '--no-freq-scaling',
+                             '--warm-cpu-us=0', '--partition-config', str(config),
+                             *extra_args], stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT, text=True, timeout=20)
+    output.write_text(result.stdout)
+    assert result.returncode != 0, 'impossible queue-home configuration was accepted'
+    assert STATE.read_text().strip() == 'disabled', 'rejected config left SCX attached'
+    assert re.search(r'(?i)(home|domain|LLC|unit)', result.stdout), result.stdout
+
+
+def remote_service(log_path):
+    """Require actual owner service from a queue outside the CPU's domain."""
+    text = log_path.read_text()
+    matches = re.findall(r'Soft partition service "([^"]+)": owned_dispatch=(\d+), '
+                         r'remote_home_dispatch=(\d+)', text)
+    assert matches, 'missing final queue-home service counters'
+    result = {part: {'owned_dispatch': int(owned), 'remote_home_dispatch': int(remote)}
+              for part, owned, remote in matches}
+    assert all(value['remote_home_dispatch'] <= value['owned_dispatch']
+               for value in result.values()), result
+    assert sum(value['remote_home_dispatch'] for value in result.values()) > 0, (
+        'no evidence that a granted CPU served its remote queue home', result)
+    return result
+
+
 def cpulist(value):
     cpus = set()
     for item in value.strip().split(','):
@@ -157,13 +187,14 @@ def main():
     parser=argparse.ArgumentParser()
     parser.add_argument('--binary', required=True)
     parser.add_argument('--output', type=Path, help='new directory for retained logs/results')
+    parser.add_argument('--virt-llc', default='2-2', help='startup virtual LLC size range')
     args=parser.parse_args()
     assert os.geteuid() == 0, 'requires root inside a private Linux test host'
     assert STATE.read_text().strip() == 'disabled', 'another scheduler is attached'
     args.binary = str(Path(args.binary).resolve(strict=True))
     cpus, cores = topology()
-    if len(cores) < 3 or len(cpus) > 32:
-        print('SKIP: requires at least 3 physical cores and at most 32 logical CPUs')
+    if len(cores) < 6 or len(cpus) > 32:
+        print('SKIP: requires at least 6 physical cores and at most 32 logical CPUs')
         return
     if args.output:
         args.output.mkdir(parents=True, exist_ok=False)
@@ -176,9 +207,11 @@ def main():
         'binary': args.binary,
     }, indent=2)+'\n')
     config=args.output/'three.json'
-    config.write_text(json.dumps({'interval_ms':200,'partitions':[
+    config_data={'interval_ms':200,'granularity':'core','partitions':[
         {'name':'default'}, {'name':'alpha','comm_prefixes':['lavd-alpha']},
-        {'name':'beta','comm_prefixes':['lavd-beta']}]}))
+        {'name':'beta','comm_prefixes':['lavd-beta']}]}
+    config.write_text(json.dumps(config_data))
+    topology_args = [f'--virt-llc={args.virt_llc}']
     cpu0={min(cpus)}
     cases=[
         ('one_busy_partition_borrows', [('lavd-alpha',cpus,False)]*(len(cpus)+2), 3),
@@ -187,36 +220,56 @@ def main():
         ('affinity_bypasses_ownership', [('lavd-alpha',cpu0,False)]*2+[('lavd-beta',cpus,False)]*4, 2),
     ]
     solo=session(args.binary,config,args.output/'solo-rename',[
-        ('solo_cpu_bound_rename', [('lavd-alpha',cpus,True)], 8)])
+        ('solo_cpu_bound_rename', [('lavd-alpha',cpus,True)], 8)], topology_args)
     owner_logs=(args.output/'solo-rename'/'scheduler.log').read_text()
-    # Three cores leave no reallocatable capacity beyond the three floors.
-    for part in (['alpha', 'beta'] if len(cores) > 3 else []):
+    for part in ['alpha', 'beta']:
         allocations=re.findall(r'Soft partition "'+part+r'": CPUs \[([^\]]*)\]', owner_logs)
         owner_sets=[{int(cpu) for cpu in value.split(',') if cpu.strip()} for value in allocations]
         counts=[sum(core <= owners for core in cores) for owners in owner_sets]
         assert max(counts,default=0)==len(cores)-2, (part,'solo demand did not claim available cores',counts)
-    first=session(args.binary,config,args.output/'three-partitions',cases)
+    first=session(args.binary,config,args.output/'three-partitions',cases,topology_args)
     borrowed=set().union(*(set(item['cpus']) for item in first['cases']['one_busy_partition_borrows']))
     # Each of the other two partitions retains one physical core, even
     # after demand-based rebalancing. Exceeding this bound proves borrowing.
     protected = sum(sorted(len(core) for core in cores)[:2])
     assert len(borrowed)>len(cpus)-protected, ('no evidence of borrowed capacity',borrowed)
     summary = {'result': 'PASS', 'borrowed_cpu_union': sorted(borrowed)}
-    if len(cores) == 3:
-        summary['rename_allocation'] = 'SKIP: three cores leave no spare ownership to move'
+    summary['core_service'] = remote_service(args.output/'three-partitions'/'scheduler.log')
+    cpu_config = args.output/'cpu-grants.json'
+    config_data['granularity'] = 'cpu'
+    cpu_config.write_text(json.dumps(config_data))
+    logical=session(args.binary,cpu_config,args.output/'cpu-grants',cases,topology_args)
+    summary['logical_cpu_workers'] = sum(len(case) for case in logical['cases'].values())
+    summary['cpu_service'] = remote_service(args.output/'cpu-grants'/'scheduler.log')
+
+    # Native per-core queues are disabled here. Constrained tasks must remain
+    # reachable through the existing physical-domain queues during remote service.
+    pin_cpu = {min(sorted(cores, key=min)[1])}
+    restricted = set(sorted(cpus)[-2:])
+    exceptions = [
+        ('pinned_without_core_queues', [('lavd-alpha',pin_cpu,False)]*2 +
+         [('lavd-beta',cpus,False)]*(len(cpus)+2), 4),
+        ('restricted_without_core_queues', [('lavd-alpha',restricted,False)]*4 +
+         [('lavd-beta',cpus,False)]*(len(cpus)+2), 4),
+    ]
+    session(args.binary,cpu_config,args.output/'native-domain-exceptions',exceptions,
+            [*topology_args,'--pinned-slice-us=0'])
+    summary['native_domain_exceptions'] = 'PASS'
+
+    # Startup topology can never provide more homes than physical cores.
+    # Reject the impossible configuration instead of silently allocating a
+    # partition queue or leaving a partition without an addressable backlog.
     if len(cores) <= 14:
-        rescue = args.output/'rescue.json'
+        impossible = args.output/'insufficient-homes.json'
         parts = [{'name': 'default'}] + [
             {'name': f'group{i}', 'comm_prefixes': [f'lavd-p{i:02d}']}
             for i in range(len(cores)+1)]
-        rescue.write_text(json.dumps({'interval_ms': 200, 'partitions': parts}))
-        specs = [(f'lavd-p{i:02d}', cpus, False) for i in range(len(cores)+1)]*2
-        specs += [('lavd-default', cpus, False)]*2
-        second = session(args.binary, rescue, args.output/'more-partitions-than-cores', [
-            ('all_partitions_progress', specs, 4)])
-        summary['rescue_workers'] = len(second['cases']['all_partitions_progress'])
+        impossible.write_text(json.dumps({'interval_ms': 200, 'partitions': parts}))
+        reject_config(args.binary, impossible, args.output/'insufficient-homes.log',
+                      ['--virt-llc=1-1'])
+        summary['insufficient_homes'] = 'PASS'
     else:
-        summary['rescue'] = 'SKIP: more than 14 physical cores'
+        summary['insufficient_homes'] = 'SKIP: more than 14 physical cores'
     (args.output/'summary.json').write_text(json.dumps(summary, indent=2)+'\n')
     print(json.dumps(summary, indent=2))
 

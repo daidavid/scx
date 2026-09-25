@@ -1,22 +1,35 @@
 # Soft partitioning in LAVD
 
-Soft partitions give groups of threads preferred CPU cores while allowing idle
-capacity to be shared. This is an experimental, opt-in mode. From the repository
-root, after building LAVD:
+This experimental mode gives thread groups preferred CPU capacity using LAVD's
+existing compute-domain queues. Queue homes stay fixed; CPU service grants resize
+with demand. It creates **no partition-specific dispatch queues**.
+
+## Start with enough queue homes
+
+Every group, including the default, needs at least one startup LLC or virtual-LLC
+unit. All compute domains of the same topology LLC (including different core
+types) belong to the same home group. Too few units is a startup error. The
+controller does not create virtual LLCs automatically.
+
+For example, on a six-core homogeneous machine with one LLC, three two-core virtual LLCs
+provide homes for the three groups in the example configuration:
 
 ```sh
-sudo target/release/scx_lavd --performance \
+sudo target/release/scx_lavd --performance --virt-llc=2-2 \
   --partition-config scheds/rust/scx_lavd/examples/soft-partitions.json
 ```
 
-`--performance` keeps all CPUs active, avoiding interaction between core
-compaction and partition ownership. `--per-cpu-dsq` and a nonzero `--warm-cpu-us`
-cannot be combined with this mode. Omit `--partition-config` for normal LAVD.
+Choose the virtual topology for your machine; the example is not a universal
+sizing recommendation. Virtualizing an LLC can increase LAVD's native queue count
+at startup. Enabling soft partitions on that same topology adds no queues.
+
+`--performance` keeps CPUs active. `--per-cpu-dsq` removes the shared queues this
+mode needs and is rejected, as is a nonzero `--warm-cpu-us`. Native pinned-task
+queues follow the existing `--pinned-slice-us` option; this feature does not force
+them on. Use `--pinned-slice-us=0` to exercise domain queues without those queues.
+Omit `--partition-config` for normal LAVD.
 
 ## Configuration
-
-The [example configuration](../examples/soft-partitions.json) groups `Render*`
-threads, `Worker*` or `Job*` threads, and everything else:
 
 ```json
 {
@@ -25,139 +38,140 @@ threads, `Worker*` or `Job*` threads, and everything else:
     { "name": "workers", "comm_prefixes": ["Worker", "Job"] },
     { "name": "default", "comm_prefixes": [] }
   ],
-  "interval_ms": 1000
+  "interval_ms": 1000,
+  "granularity": "core"
 }
 ```
 
-Matching uses the thread's Linux `comm`, not its command line. A partition
-matches when any prefix matches; the first matching specific partition wins.
-Prefixes are case sensitive. An empty or omitted `comm_prefixes` declares the
-default partition. It receives internal ID 0 regardless of its position in the
-file; specific partitions retain their relative order. If omitted, a partition
-named `default` is added automatically.
+`granularity` controls CPU grants, not queue topology:
 
-Names must be nonempty and unique. There may be at most 16 partitions including
-the default, and at most 8 prefixes per partition. Each prefix must contain 1
-to 15 ASCII bytes with no NUL. Multiple defaults, unknown fields, and an implicit
-default whose name conflicts with a specific partition are rejected. The
-partition list must be nonempty.
+| Value | Grant unit | SMT behavior |
+| --- | --- | --- |
+| `core` (default) | One physical core | Online siblings serve the same group. |
+| `cpu` | One logical CPU | Siblings may serve different groups. |
 
-`interval_ms` defaults to 1000 and accepts 100 through 60000. It controls demand
-sampling and ownership updates. Thread renames are reflected at the next CPU
-selection, enqueue, scheduler tick, or solo-task slice refill. Configuration is
-read at startup; restart LAVD to apply file edits. Startup and changed assignments are logged with partition names,
-logical CPU IDs, and smoothed demand in CPU units.
+Matching uses Linux thread `comm`, not the command line. Prefixes are case
+sensitive; the first matching specific partition wins. An empty or omitted
+`comm_prefixes` declares the default. It receives internal ID 0 regardless of
+file position; other groups retain their relative order. If omitted, a group
+named `default` is added automatically and also needs a queue home.
 
-## Scheduling and sizing
+There may be at most 16 groups including the default, with unique nonempty names
+and at most 8 prefixes each. A prefix contains 1–15 ASCII bytes with no NUL.
+Multiple defaults, unknown fields, an empty partitions list, and conflicting names are
+rejected. `interval_ms` defaults to 1000 and accepts 100–60000. Configuration is
+read at startup. Renames take effect at the next classification callback,
+including enqueue, selection, tick, or solo-task refill.
 
-Each partition has a global dispatch queue ordered by LAVD virtual deadlines.
-CPUs prefer their owner's work when groups compete. Waking tasks first seek idle
-CPUs owned by their partition, then borrow idle CPUs elsewhere. Borrowing does
-not change task affinity. A borrowed task is placed again after its slice instead
-of retaining another partition's CPU indefinitely.
+## Fixed homes, movable service
 
-Tasks with restricted affinity, CPU pinning, or migration disabled use native
-per-core queues outside the partition queues. Their legal CPUs remain authoritative.
-Native work participates in deadline selection and has a service guard. Groups
-whose queues have gone unserved also receive rescue service, including groups
-with no owned cores. The rescue threshold is eight maximum slices; it is not a
-latency guarantee when several groups compete.
+At startup, each whole LLC/vLLC unit is assigned to a group, balanced by unit
+count. Its native steady and turbulent DSQs remain that group's homes for the
+scheduler's lifetime. Ordinary unconstrained tasks queue in their group's homes.
+CPU grants say which group each CPU should serve, independently of its physical
+compute domain.
 
-Demand estimates how much CPU a thread would use without queue contention:
-`running time / (running time + sleeping time)`. Queue wait is excluded, so a
-CPU-bound thread remains hungry when delayed. Tasks smooth this estimate with a
-100 ms time constant and accumulate demand over elapsed time in Q10 units
-(1024 represents one CPU). Runtime accounting includes continuous execution and
-slice extensions. Userspace divides counter deltas by elapsed time and applies
-an EWMA with one-quarter weight on each new sample.
+For example, Alpha's home may be vLLC 0 and Beta's home vLLC 1. When Alpha grows
+onto one core in vLLC 1, that core consumes Alpha's queues in vLLC 0 into its
+built-in LOCAL DSQ. After a slice, Alpha's work queues at an Alpha home again.
+Beta's queues stay in vLLC 1 throughout. No queue drain or queue-owner transfer
+is needed for this grant change.
 
-Allocation keeps SMT siblings together. Each partition receives one physical
-core when enough cores exist, then the remaining cores are divided by demand
-using largest remainders. All-zero demand starts with equal allocation. Existing
-ownership is retained up to each new quota, limiting movement. If there are fewer
-cores than partitions, the highest-demand groups each receive one core, with
-partition ID breaking ties; queue rescue keeps the remaining groups schedulable.
+This deliberately relaxes whole-LLC growth for the requested finer granularity.
+Queue affiliation still follows whole LLC/vLLC boundaries; **CPU grants may split
+a unit**. The allocator prefers own homes, then the same physical LLC, then the
+same NUMA node. It packs necessary transfers in topology order and retains
+existing grants when quotas do not change. It does not guarantee whole-unit
+expansion, a single partially shared frontier, or continuous defragmentation.
 
-These are preferred resources, not hard isolation, fixed shares, or CPU limits.
-The allocator counts cores equally; it does not normalize heterogeneous core
-capacity. Global partition queues also lack LAVD's normal per-LLC queue locality
-and separate steady/turbulent queues. Evaluate these tradeoffs on the target
-machine, particularly across NUMA nodes or mixed core types.
+Each group receives one grant unit when enough online units remain. Remaining
+units are divided by smoothed demand using largest remainders; when every group has zero demand, allocation is equal. After hotplug, fewer units than groups gives the highest-demand
+groups grants while queue rescue preserves a service path for others. Core mode
+uses the primary CPU's owner word for both SMT siblings, including when only the
+secondary sibling is online. The preferred placement masks are hints; dispatch
+and preemption read the service owner.
 
-This design draws on [scx_mitosis PR #3817](https://github.com/sched-ext/scx/pull/3817),
-reviewed at commit `59337e20`, particularly sibling CPU sharing and demand-based
-sizing. LAVD exposes one flat partition layer; it does not implement mitosis
-cgroup cells, nested subcells, or cgroup-path matching.
+## Service, borrowing, and exceptions
 
-## Validation
+A waking task first seeks an idle granted CPU, then an allowed idle CPU elsewhere.
+Dispatch prefers the service owner's home queues; unused capacity can pull other
+groups' home queues. Regular slices, owner wakeup kicks, and tick checks reclaim
+borrowed CPUs. Updating grants kicks affected runners. Already running or LOCAL
+work can outlive an update until a scheduling transition; there is no instantaneous
+handoff or hard reclaim-latency guarantee.
 
-From the repository root on a Linux build host with the SCX build dependencies:
+Pinned tasks, restricted-affinity tasks, and migration-disabled work use native
+placement outside the participating groups. Their legal CPUs remain authoritative.
+Native exception queue heads compete by deadline. Every eight maximum slices,
+physical-queue rescue may also consume ordinary foreign work to uncover constrained
+tasks behind it. Unserved home queues have a separate rescue path. These are
+periodic service opportunities, not per-task latency guarantees. Native exceptions
+and rescue can reduce the service owner's share under contention.
+
+The existing steady/turbulent queue pairs remain in use. Tier thresholds aggregate
+the CPUs actually granted to each group rather than the physical CPUs beside its
+queues. Ordinary physical-domain balancing is bypassed because queue residence
+and execution capacity no longer coincide. Queue-load accounting follows the
+actual queue home; runtime accounting follows the executing CPU. Native cpu.max
+admission and deferred enqueue paths remain active.
+
+Demand estimates uncontended usage as `running / (running + sleeping)`; queue wait
+is excluded. Per-task demand uses a 100 ms time constant and Q10 CPU units. The
+controller computes counter deltas and applies an EWMA with one-quarter new
+sample weight. Affinity-exempt work does not contribute to participating demand.
+
+This is preferred capacity, not hard isolation, fixed shares, or CPU limits.
+Equal grant counts do not imply equal compute capacity on heterogeneous CPUs or
+split SMT siblings. Remote home access can add contention and NUMA/cache costs.
+Home scans add work proportional to configured compute domains. Fixed homes may
+be imbalanced; this prototype does not resize or migrate queue affiliation.
+
+## Observe and validate
+
+Startup logs distinguish `home compute domains` / `home CPUs` from changing
+`CPUs` grants. On orderly exit, `owned_dispatch` counts successful pulls from
+service-owner homes and `remote_home_dispatch` counts the subset whose queue
+compute domain differs from the serving CPU's physical domain. These count
+queue service, including native exceptions, rather than all task executions or
+throughput. Direct LOCAL dispatch is not included. `native rescues` counts
+successful periodic physical-queue pulls.
+
+On a Linux host with the SCX build dependencies:
 
 ```sh
 cargo build --release -p scx_lavd
 cargo test -p scx_lavd
-```
-
-Demand arithmetic tests also run without Linux or a BPF loader. Exercise both
-the enabled implementation and disabled fast path:
-
-```sh
 cc -std=gnu11 -Wall -Wextra -Werror -O2 \
   scheds/rust/scx_lavd/tests/partition_demand.c -o /tmp/lavd-demand
 /tmp/lavd-demand
 cc -std=gnu11 -Wall -Wextra -Werror -O2 -DTEST_NR_PARTITIONS=0 \
   scheds/rust/scx_lavd/tests/partition_demand.c -o /tmp/lavd-demand-disabled
 /tmp/lavd-demand-disabled
-```
-
-For a verifier and attachment smoke test on a Linux kernel supporting this
-LAVD build, run as root. `--partial` limits scheduling to tasks opting into SCX:
-
-```sh
-sudo timeout --signal=INT 10s target/release/scx_lavd --performance --partial \
-  --partition-config scheds/rust/scx_lavd/examples/soft-partitions.json
-```
-
-An exit status of 124 is expected when `timeout` ends the test. Check the log
-for successful attachment and orderly shutdown; an early verifier/load failure
-is not a successful smoke test. Partial attachment alone does not exercise
-partition scheduling. For workload validation, run without `--partial` on a test
-machine, or arrange for the test tasks to opt into SCX.
-
-The automated Linux smoke test creates its own configuration and enrolls only
-its worker processes in SCX. It covers CPU borrowing, returning owner work,
-renames (including a solo CPU-bound thread), affinity, and more partitions than
-cores. It prints the directory containing retained logs and results:
-
-```sh
 sudo python3 scheds/rust/scx_lavd/tests/soft_partition.py \
-  --binary target/release/scx_lavd
+  --binary target/release/scx_lavd --virt-llc=2-2
 ```
 
-The test requires at least three physical cores and full online CPU affinity;
-its module documentation describes larger-host skips. The manual matrix below
-also covers workloads beyond this bounded smoke test.
+The smoke test enrolls only its worker processes in SCX and retains logs. It
+requires at least six physical cores, at most 32 logical CPUs, full online CPU
+affinity, and enough startup units for three homes. It covers borrowing, returning
+owners, renames, affinity, both grant granularities, positive remote queue service,
+insufficient-home rejection, and pinned-task progress with per-core queues disabled.
 
-| Scenario | What to check |
-| --- | --- |
-| Saturation | Run different counts of CPU-bound `Render*` and `Worker*` threads. Ownership should settle toward their demand ratio after floors. |
-| Duty cycles | Compare many short-running sleepers with fewer CPU-bound threads. Size should follow work, not just thread count. |
-| Idle borrowing | Stop one group's work. Busy groups should use its idle CPUs while its owned-core floor remains. |
-| Rename | Have a worker change its own `comm` with `prctl(PR_SET_NAME)`. It should change groups at its next placement. |
-| Affinity | Restrict workers with `taskset`, including a single logical CPU. Verify execution stays within their affinity. |
-| CPU bandwidth | Enable `--enable-cpu-bw`, apply a cgroup v2 `cpu.max`, and verify throttling still limits the workload. |
-| More groups than cores | Use more configured groups than physical cores, up to 16. Every runnable group must continue making progress. |
-| CPU hotplug | Offline and restore a test CPU while groups are busy. Check ownership, forward progress, and scheduler logs. |
+Before wider use, test actual SMT hardware, multiple NUMA nodes, heterogeneous
+cores, hotplug, cpu.max, and saturated latency-sensitive workloads. Unit tests
+cover topology grouping, split SMT vs whole cores, offline-primary staging,
+capacity conservation, and stable allocation; they cannot establish hardware
+performance or verifier portability. Linux build/load and workload results for
+the development VM are recorded in the patch review bundle.
 
-CPU lists are refreshed at the sampling interval. Ownership during hotplug is a
-soft hint; an empty or stale preferred mask falls back to legal CPUs. A CPU whose
-topology was absent at startup may require LAVD's existing restart path. Tests
-above are a validation procedure, not a claim that a particular kernel or
-machine has passed.
+## Review boundaries
 
-## Patch review boundaries
+The prototype follows the earlier demand/classification patches with three
+review units: pure configuration and grant policy; BPF queue-home service with
+userspace integration; then usage and workload checks. The earlier partition-DSQ
+branch remains available for comparison.
 
-The series separates configuration and core allocation, task demand accounting,
-BPF classification and queue service, the userspace sampling/controller loop,
-and documentation. Configuration and arithmetic tests can be reviewed without
-loading a scheduler. Verifier and workload checks validate the integration.
+The initial demand-sizing work draws on
+[scx_mitosis PR #3817](https://github.com/sched-ext/scx/pull/3817), reviewed at
+`59337e20`. This LAVD prototype has one flat prefix-matched group layer, without
+mitosis cgroup cells, nested subcells, or cgroup-path matching.
