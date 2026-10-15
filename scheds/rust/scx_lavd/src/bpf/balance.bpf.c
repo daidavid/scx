@@ -139,24 +139,35 @@ reset_role:
 	return 0;
 }
 
-/* a stealee compute domain is on the node; read by the NUMA placement path */
+/*
+ * Per-node summaries for the NUMA balancing paths, refreshed every
+ * balancing round: a stealee compute domain is on the node, and an active
+ * CPU is on the node.
+ */
 volatile u8 numa_has_stealee[LAVD_NUMA_ID_MAX];
+volatile u8 numa_has_active[LAVD_NUMA_ID_MAX];
 
-static void update_numa_stealee(void)
+static void update_numa_summary(void)
 {
 	struct cpdom_ctx *cpdomc;
 	u64 cpdom_id;
 	int nid;
 
-	bpf_for(nid, 0, LAVD_NUMA_ID_MAX)
+	bpf_for(nid, 0, LAVD_NUMA_ID_MAX) {
 		WRITE_ONCE(numa_has_stealee[nid], 0);
+		WRITE_ONCE(numa_has_active[nid], 0);
+	}
 
 	bpf_for(cpdom_id, 0, nr_cpdoms) {
 		if (cpdom_id >= LAVD_CPDOM_MAX_NR)
 			break;
 		cpdomc = MEMBER_VPTR(cpdom_ctxs, [cpdom_id]);
-		if (cpdomc && cpdomc->is_valid && READ_ONCE(cpdomc->is_stealee))
+		if (!cpdomc || !cpdomc->is_valid)
+			continue;
+		if (READ_ONCE(cpdomc->is_stealee))
 			WRITE_ONCE(numa_has_stealee[cpdomc->numa_id], 1);
+		if (READ_ONCE(cpdomc->nr_active_cpus))
+			WRITE_ONCE(numa_has_active[cpdomc->numa_id], 1);
 	}
 }
 
@@ -246,7 +257,7 @@ int plan_x_cpdom_migration(void)
 		goto reset_and_skip_lb;
 
 	sys_stat.nr_stealee = nr_stealee;
-	update_numa_stealee();
+	update_numa_summary();
 
 	return 0;
 
@@ -263,8 +274,8 @@ reset_and_skip_lb:
 			WRITE_ONCE(cpdomc->is_stealee, false);
 		}
 		sys_stat.nr_stealee = 0;
-		update_numa_stealee();
 	}
+	update_numa_summary();
 	return 0;
 }
 
@@ -299,6 +310,101 @@ u64 __attribute__((noinline)) dsq_peek_task_load(u64 dsq_id)
 			return task_load_metric(peek_taskc);
 	}
 	return 0;
+}
+
+static __always_inline bool numa_decline_expired(task_ctx *taskc)
+{
+	u64 round = READ_ONCE(sys_stat.last_update_clk);
+
+	/*
+	 * Give up declining a task that has been declined across many
+	 * balancing rounds without running, as the fair class gives up after
+	 * cache_nice_tries failed rounds: its node is not serving it, for
+	 * example because RT or DL work holds the node's active CPUs, and
+	 * running remote beats waiting. The count is cleared when it runs.
+	 */
+	if (taskc->numa_decline_clk != round) {
+		taskc->numa_decline_clk = round;
+		taskc->numa_decline_rounds++;
+	}
+	return taskc->numa_decline_rounds > LAVD_NUMA_DECLINE_MAX_ROUNDS;
+}
+
+/*
+ * NUMA balancing: steal across nodes only a task that has no preferred
+ * node or prefers the stealer's node, @stealer_nid. A task is never pulled
+ * off the node it prefers or onto a third one: the move would trade remote
+ * memory accesses for a few idle cycles, and the task would come back at
+ * its next pick. The fair class declines such moves in
+ * migrate_degrades_locality().
+ *
+ * Walk the first few tasks of @dsq_id and move the first one allowed, which
+ * is the task checked, where a consume would take whichever task heads the
+ * queue at that moment. With @protect false every task is allowed: the
+ * queue sits on a node with no active CPU, so nothing but a steal serves
+ * it, and there is no locality to protect on a node that core compaction
+ * has parked. A task declined across LAVD_NUMA_DECLINE_MAX_ROUNDS rounds
+ * is allowed too, see numa_decline_expired().
+ *
+ * Returns the moved task's load, or -ENOENT when nothing was moved.
+ */
+__hidden __attribute__((noinline))
+s64 numa_steal_task(u64 dsq_id, s32 stealer_nid, bool protect)
+{
+	struct task_struct *p;
+	s32 cpu = bpf_get_smp_processor_id();
+	bool declined = false;
+	int depth = 0;
+
+	bpf_for_each(scx_dsq, p, dsq_id, 0) {
+		task_ctx *taskc;
+		bool moved;
+		s64 load;
+
+		if (depth++ >= LAVD_NUMA_STEAL_DEPTH)
+			break;
+
+		/* See scan_dsq_for_ovflw_ext() for the bpf_task_from_pid() hack. */
+		p = bpf_task_from_pid(p->pid);
+		if (!p)
+			continue;
+
+		taskc = find_task_ctx(p);
+		if (!taskc) {
+			bpf_task_release(p);
+			continue;
+		}
+		if (protect && taskc->numa_nid >= 0 &&
+		    taskc->numa_nid != stealer_nid &&
+		    !numa_decline_expired(taskc)) {
+			declined = true;
+			bpf_task_release(p);
+			continue;
+		}
+		/*
+		 * scx_bpf_dsq_move() into SCX_DSQ_LOCAL aborts the scheduler
+		 * on a task that cannot run here, where a consume skips it.
+		 */
+		if (is_migration_disabled(p) ||
+		    !bpf_cpumask_test_cpu(cpu, p->cpus_ptr)) {
+			bpf_task_release(p);
+			continue;
+		}
+
+		load = task_load_metric(taskc);
+		moved = scx_bpf_dsq_move(BPF_FOR_EACH_ITER, p, SCX_DSQ_LOCAL, 0);
+		bpf_task_release(p);
+		if (moved)
+			return load;
+	}
+
+	if (declined) {
+		struct cpu_ctx *cpuc = get_cpu_ctx();
+
+		if (cpuc)
+			cpuc->nr_numa_declined++;
+	}
+	return -ENOENT;
 }
 
 u64 __attribute__((noinline)) pick_most_loaded_dsq(struct cpdom_ctx *cpdomc)
@@ -426,6 +532,27 @@ static bool try_to_steal_task(struct cpdom_ctx *cpdomc)
 				continue;
 
 			/*
+			 * NUMA balancing: a cross-node steal takes only a task
+			 * allowed to come here, see numa_steal_task().
+			 */
+			if (numa_balancing_active() &&
+			    cpdomc_pick->numa_id != cpdomc->numa_id) {
+				s64 load = numa_steal_task(dsq_id, cpdomc->numa_id,
+							   READ_ONCE(numa_has_active[cpdomc_pick->numa_id]));
+
+				if (load < 0)
+					continue;
+				if (no_fast_lb) {
+					WRITE_ONCE(cpdomc_pick->is_stealee, false);
+					WRITE_ONCE(cpdomc->is_stealer, false);
+				} else {
+					decrement_stealee_budget(cpdomc_pick, load);
+					decrement_stealer_budget(cpdomc, load);
+				}
+				return true;
+			}
+
+			/*
 			 * Peek at the head task to get its size for budget
 			 * accounting. Skip the peek when no_fast_lb is set
 			 * since the budget path below is bypassed and the
@@ -518,6 +645,27 @@ static bool force_to_steal_task(struct cpdom_ctx *cpdomc)
 			 */
 			if ((s64)dsq_id < 0)
 				continue;
+
+			/*
+			 * NUMA balancing: force stealing across nodes takes
+			 * only a task allowed to come here as well. A node
+			 * whose queued tasks all prefer it is left to its own
+			 * CPUs while this one idles: the intended trade,
+			 * locality over idle cycles, counted as NUMA-DECL.
+			 */
+			if (numa_balancing_active() &&
+			    cpdomc_pick->numa_id != cpdomc->numa_id) {
+				s64 load = numa_steal_task(dsq_id, cpdomc->numa_id,
+							   READ_ONCE(numa_has_active[cpdomc_pick->numa_id]));
+
+				if (load < 0)
+					continue;
+				if (!no_fast_lb) {
+					decrement_stealee_budget(cpdomc_pick, load);
+					decrement_stealer_budget(cpdomc, load);
+				}
+				return true;
+			}
 
 			/*
 			 * Peek at the head task to get its size. Skip the

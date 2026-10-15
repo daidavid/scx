@@ -128,6 +128,8 @@ enum consts_internal {
 	LAVD_NUMA_SETTLE_NS		= LAVD_TIME_ONE_SEC, /* a new preferred node is acted on once it held this long */
 	LAVD_NUMA_RETRY_MAX_NS		= LAVD_TIME_ONE_SEC, /* cap of the interval between moves toward the preferred node */
 	LAVD_NUMA_RETRY_SHIFT		= 4, /* the interval is the task's NUMA scan period / 16, as in the fair class */
+	LAVD_NUMA_STEAL_DEPTH		= 4, /* queue entries a cross-node steal examines */
+	LAVD_NUMA_DECLINE_MAX_ROUNDS	= 10, /* declines across this many rounds end a waiting task's protection */
 
 	LAVD_FUTEX_OP_INVALID		= -1,
 };
@@ -225,7 +227,8 @@ struct task_ctx {
 	volatile u32	suggested_cpu_id;	/* suggested CPU ID at ops.enqueue() and ops.select_cpu() */
 	volatile s32	pinned_cpu_id;		/* pinned CPU id. -ENOENT if not pinned or not runnable. */
 	s16	numa_nid;		/* preferred NUMA node reported by the kernel, NUMA_NO_NODE if none */
-	u8	__pad0[2];
+	u8	numa_decline_rounds;	/* balancing rounds in which a cross-node steal declined this waiting task */
+	u8	__pad0;
 	u64	last_running_clk;	/* last time when scheduled in */
 	u64	run_freq;		/* scheduling frequency in a second */
 	u64	wait_freq;		/* waiting frequency in a second */
@@ -256,6 +259,7 @@ struct task_ctx {
 	pid_t	pid;			/* pid for this task */
 	pid_t	waker_pid;		/* last waker's PID */
 	u64	numa_retry_clk;		/* earliest time to try a move to the preferred NUMA node */
+	u64	numa_decline_clk;	/* balancing round of the last counted decline */
 
 	/* --- cacheline 5 boundary (320 bytes): ravg/util read-mostly group --- */
 	u32	util_est __attribute__((aligned(CACHELINE_SIZE)));
@@ -521,6 +525,7 @@ struct cpu_ctx {
 	volatile u32	max_freq_observed; /* maximum CPU frequency observed within an interval scaled to 1024 */
 	volatile u32	max_freq;	/* maximum CPU frequency averaged across multiple intervals */
 	volatile u32	nr_numa_mig;	/* picks that moved a task to its preferred NUMA node */
+	volatile u32	nr_numa_declined; /* cross-node steals and donations declined for NUMA locality */
 	/*
 	 * Snapshot of scx_clock_task() taken at the end of the last
 	 * collect_sys_stat() interval. scx_clock_task() advances during tasks
@@ -587,6 +592,7 @@ extern const volatile u8	verbose;
 extern const volatile u8	numa_balancing; /* ops.set_numa_node() is installed */
 extern volatile u8		numa_balancing_on; /* kernel.numa_balancing is on */
 extern volatile u8		numa_has_stealee[LAVD_NUMA_ID_MAX]; /* a stealee cpdom is on the node */
+extern volatile u8		numa_has_active[LAVD_NUMA_ID_MAX]; /* an active CPU is on the node */
 
 /* Whether preferred NUMA nodes are reported and are to be acted on. */
 static inline bool numa_balancing_active(void)

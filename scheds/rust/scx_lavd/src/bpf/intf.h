@@ -77,6 +77,7 @@ struct sys_stat {
 	u64	nr_lat_cri;	/* number of latency-critical tasks scheduled */
 	u64	nr_x_migration; /* number of cross domain migration */
 	u64	nr_numa_mig;	/* number of migrations to the preferred NUMA node */
+	u64	nr_numa_declined; /* number of cross-node steals and donations declined for NUMA locality */
 	u64	nr_big;		/* scheduled on big core */
 	u64	nr_pc_on_big;	/* performance-critical tasks scheduled on big core */
 	u64	nr_lc_on_big;	/* latency-critical tasks scheduled on big core */

@@ -534,6 +534,10 @@ static void update_stat_for_running(struct task_struct *p,
 	prev_cpuc = get_cpu_ctx_id(taskc->prev_cpu_id);
 	if (prev_cpuc && prev_cpuc->cpdom_id != cpuc->cpdom_id)
 		cpuc->nr_x_migration++;
+
+	/* NUMA balancing: the task runs, so it no longer waits on a decline. */
+	if (taskc->numa_decline_rounds)
+		taskc->numa_decline_rounds = 0;
 }
 
 static void account_task_runtime(struct task_struct *p,
@@ -2271,6 +2275,8 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(lavd_init_task, struct task_struct *p,
 	/* The kernel reports the preferred NUMA node after ops.enable(). */
 	taskc->numa_nid = NUMA_NO_NODE;
 	taskc->numa_retry_clk = 0;
+	taskc->numa_decline_rounds = 0;
+	taskc->numa_decline_clk = 0;
 
 	bpf_rcu_read_lock();
 	set_affinity_flags(taskc, p->cpus_ptr);
