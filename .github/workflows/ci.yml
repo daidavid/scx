@@ -75,6 +75,10 @@ jobs:
           - name: scx__stable__linux-rolling-stable
             url: https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git
             tag: linux-rolling-stable
+            # ops.set_numa_node() is not in this kernel, so lavd_set_numa_node
+            # cannot be verified against it, and the wrapper can exclude whole
+            # packages only.
+            veristat-disable: scx_lavd
           - name: scx__stable__6_13
             url: https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git
             tag: linux-6.13.y
@@ -86,6 +90,10 @@ jobs:
           - name: scx__stable__6_18
             url: https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git
             tag: linux-6.18.y
+            # ops.set_numa_node() is not in this kernel, so lavd_set_numa_node
+            # cannot be verified against it, and the wrapper can exclude whole
+            # packages only.
+            veristat-disable: scx_lavd
     runs-on: ubuntu-24.04
     timeout-minutes: 35
     steps:
@@ -143,11 +151,17 @@ jobs:
           - name: scx__sched_ext__for-next
             url: https://git.kernel.org/pub/scm/linux/kernel/git/tj/sched_ext.git
             tag: for-next
-            veristat-disable: scx_p2dq scx_chaos
+            # ops.set_numa_node() is not in this kernel, so lavd_set_numa_node
+            # cannot be verified against it, and the wrapper can exclude whole
+            # packages only.
+            veristat-disable: scx_p2dq scx_chaos scx_lavd
           - name: scx__bpf__bpf-next
             url: https://git.kernel.org/pub/scm/linux/kernel/git/bpf/bpf-next.git
             tag: master
-            veristat-disable: scx_p2dq scx_chaos
+            # ops.set_numa_node() is not in this kernel, so lavd_set_numa_node
+            # cannot be verified against it, and the wrapper can exclude whole
+            # packages only.
+            veristat-disable: scx_p2dq scx_chaos scx_lavd
     runs-on: ubuntu-24.04
     timeout-minutes: 35
     continue-on-error: true

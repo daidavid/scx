@@ -234,6 +234,18 @@ const volatile u8	no_ovrflw_extend;
 const volatile u64	warm_cpu_ns = 0;
 
 /*
+ * ops.set_numa_node() is installed: the kernel reports preferred NUMA
+ * nodes and runs the hinting-fault scan for lavd's tasks.
+ */
+const volatile u8	numa_balancing = 0;
+
+/*
+ * kernel.numa_balancing is on, followed at run time by userspace. With it
+ * off the kernel stops updating preferred nodes, so they are not acted on.
+ */
+volatile u8		numa_balancing_on = 0;
+
+/*
  * Skip periodic load balancing when average system utilization is below this
  * threshold. The value is pre-scaled by userspace. 0 = disabled.
  * Default: p2s(25) = 256.
@@ -2089,6 +2101,27 @@ void BPF_STRUCT_OPS(lavd_set_cpumask, struct task_struct *p,
 	set_affinity_flags(taskc, cpumask);
 }
 
+/*
+ * The kernel reports the node NUMA balancing prefers for @p: once after
+ * ops.enable() and on every change, under @p's rq lock inside the dequeue
+ * and enqueue cycle of sched_setnuma(). Only record it here; the placement
+ * paths act on it at the task's next CPU pick.
+ */
+void BPF_STRUCT_OPS(lavd_set_numa_node, struct task_struct *p, s32 nid)
+{
+	task_ctx *taskc;
+
+	taskc = get_task_ctx(p);
+	if (!taskc) {
+		scx_bpf_error("task_ctx_stor first lookup failed");
+		return;
+	}
+
+	if (nid < 0 || nid >= LAVD_NUMA_ID_MAX)
+		nid = NUMA_NO_NODE;
+	taskc->numa_nid = nid;
+}
+
 void BPF_STRUCT_OPS(lavd_cpu_release, s32 cpu,
 		    struct scx_cpu_release_args *args)
 {
@@ -2223,6 +2256,9 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(lavd_init_task, struct task_struct *p,
 	/* Per-CPU warmth is task+CPU private -- never inherit it. */
 	taskc->cpu_heat = 0;
 	taskc->last_stopping_clk = scx_bpf_now();
+
+	/* The kernel reports the preferred NUMA node after ops.enable(). */
+	taskc->numa_nid = NUMA_NO_NODE;
 
 	bpf_rcu_read_lock();
 	set_affinity_flags(taskc, p->cpus_ptr);
@@ -2885,6 +2921,7 @@ SCX_OPS_DEFINE(lavd_ops,
 	       .cpu_offline		= (void *)lavd_cpu_offline,
 	       .update_idle		= (void *)lavd_update_idle,
 	       .set_cpumask		= (void *)lavd_set_cpumask,
+	       .set_numa_node		= (void *)lavd_set_numa_node,
 	       .cpu_release		= (void *)lavd_cpu_release,
 	       .enable			= (void *)lavd_enable,
 	       .init_task		= (void *)lavd_init_task,

@@ -199,6 +199,16 @@ struct Opts {
     #[clap(long = "no-use-em", action = clap::ArgAction::SetTrue)]
     no_use_em: bool,
 
+    /// Do not take part in NUMA balancing. By default, on a kernel that
+    /// reports preferred NUMA nodes through ops.set_numa_node(), on a machine
+    /// with more than one node and with kernel.numa_balancing on, the
+    /// scheduler implements the callback, which also enables the kernel's
+    /// NUMA hinting-fault scan for its tasks, and places tasks by the
+    /// reported node while the sysctl stays on. This option leaves the
+    /// callback unset.
+    #[clap(long = "no-numa-balancing", action = clap::ArgAction::SetTrue)]
+    no_numa_balancing: bool,
+
     /// Do not boost futex holders.
     #[clap(long = "no-futex-boost", action = clap::ArgAction::SetTrue)]
     no_futex_boost: bool,
@@ -720,6 +730,30 @@ impl<'a> Scheduler<'a> {
         }
     }
 
+    /// Whether kernel.numa_balancing has NUMA_BALANCING_NORMAL set, which is
+    /// what drives the hinting-fault scan the preferred node comes from.
+    fn numa_balancing_sysctl_on() -> bool {
+        std::fs::read_to_string("/proc/sys/kernel/numa_balancing")
+            .ok()
+            .and_then(|s| s.trim().parse::<u32>().ok())
+            .is_some_and(|mode| mode & 1 != 0)
+    }
+
+    /// Follow kernel.numa_balancing at run time. With it off the kernel
+    /// stops updating preferred nodes, so the frozen ones must not be
+    /// acted on.
+    fn refresh_numa_balancing(&mut self) {
+        if self.skel.maps.rodata_data.as_ref().unwrap().numa_balancing == 0 {
+            return;
+        }
+        let on = Self::numa_balancing_sysctl_on() as u8;
+        let bss_data = self.skel.maps.bss_data.as_mut().unwrap();
+        if bss_data.numa_balancing_on != on {
+            info!("NUMA balancing: {}", if on != 0 { "on" } else { "off" });
+            bss_data.numa_balancing_on = on;
+        }
+    }
+
     fn init_globals(
         skel: &mut OpenBpfSkel,
         opts: &Opts,
@@ -756,6 +790,25 @@ impl<'a> Scheduler<'a> {
         rodata.enable_cpu_bw = opts.enable_cpu_bw;
         // Replenishment wakes dispatch through the built-in idle tracking.
         rodata.bw_kick_builtin_idle = true;
+
+        // Take part in NUMA balancing only when it can do something: the
+        // kernel has ops.set_numa_node(), there is more than one node,
+        // kernel.numa_balancing is on and the user did not opt out. Leaving
+        // the callback unset also leaves the kernel's hinting-fault scan off
+        // for our tasks, so a stale preference is never reported.
+        let numa_balancing = !opts.no_numa_balancing
+            && order.nr_numa > 1
+            && compat::struct_has_field("sched_ext_ops", "set_numa_node").unwrap_or(false)
+            && Self::numa_balancing_sysctl_on();
+        rodata.numa_balancing = numa_balancing as u8;
+        bss_data.numa_balancing_on = numa_balancing as u8;
+        if !numa_balancing {
+            skel.struct_ops.lavd_ops_mut().set_numa_node = std::ptr::null_mut();
+        }
+        info!(
+            "NUMA balancing: {}",
+            if numa_balancing { "on" } else { "off" }
+        );
 
         // Fail hard if cpu.max was explicitly requested but the kernel lacks
         // ops.cgroup_set_bandwidth support; setup_cgroup_bw() otherwise disables
@@ -1095,6 +1148,7 @@ impl<'a> Scheduler<'a> {
                 }
             }
             self.cleanup_introspec();
+            self.refresh_numa_balancing();
         }
 
         bpf_streams::dump_bpf_streams(&mut self.skel);
