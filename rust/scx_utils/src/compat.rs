@@ -1008,9 +1008,9 @@ macro_rules! scx_ops_cid_open {
 /// scx_ops_attach!() are used to open, load and attach it, backward
 /// compatibility is automatically maintained where reasonable.
 /*
- * Load-time fix-ups that only exist in the cpu ops form. The cid form renamed
- * the cgroup callbacks to cpuctl_*, so referencing these members would not
- * compile against a cid-form skeleton.
+ * Load-time fix-ups per ops form. The cid form renamed the cgroup callbacks
+ * to cpuctl_*, so referencing those members would not compile against a
+ * cid-form skeleton; ops.set_numa_node() exists in both forms.
  */
 #[doc(hidden)]
 #[rustfmt::skip]
@@ -1029,8 +1029,21 @@ macro_rules! __scx_ops_form_fixups {
                 $ops_ref.cgroup_set_idle = std::ptr::null_mut();
             }
         }
+        if !$ops_ref.set_numa_node.is_null() {
+            if let Ok(false) | Err(_) = scx_utils::compat::struct_has_field("sched_ext_ops", "set_numa_node") {
+                ::scx_utils::warn!("kernel doesn't support ops.set_numa_node()");
+                $ops_ref.set_numa_node = std::ptr::null_mut();
+            }
+        }
     };
-    (cid, $ops_ref: expr) => {};
+    (cid, $ops_ref: expr) => {
+        if !$ops_ref.set_numa_node.is_null() {
+            if let Ok(false) | Err(_) = scx_utils::compat::struct_has_field("sched_ext_ops_cid", "set_numa_node") {
+                ::scx_utils::warn!("kernel doesn't support ops.set_numa_node()");
+                $ops_ref.set_numa_node = std::ptr::null_mut();
+            }
+        }
+    };
 }
 
 #[doc(hidden)]
