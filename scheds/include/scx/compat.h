@@ -274,6 +274,7 @@ static inline long scx_hotplug_seq(void)
  * - v6.19: ops.cgroup_set_idle()
  * - v7.1:  ops.sub_attach(), ops.sub_detach(), ops.sub_cgroup_id
  * - v7.3:  ops.rescue_bandwidth_ppt, ops.rescue_quantum_us
+ * - v7.4:  ops.set_numa_node() (scx-numa-balancing branch)
  */
 #define __SCX_OPS_OPEN(__ops_name, __scx_name, __ops_struct, __opts) ({		\
 	struct __scx_name *__oskel;						\
@@ -301,6 +302,11 @@ static inline long scx_hotplug_seq(void)
 	    !__COMPAT_struct_has_field("sched_ext_ops", "cgroup_set_idle")) { \
 		fprintf(stderr, "WARNING: kernel doesn't support ops.cgroup_set_idle()\n"); \
 		__skel->struct_ops.__ops_name->cgroup_set_idle = NULL;	\
+	}									\
+	if (__skel->struct_ops.__ops_name->set_numa_node &&			\
+	    !__COMPAT_struct_has_field("sched_ext_ops", "set_numa_node")) {	\
+		fprintf(stderr, "WARNING: kernel doesn't support ops.set_numa_node()\n"); \
+		__skel->struct_ops.__ops_name->set_numa_node = NULL;		\
 	}									\
 	if (__skel->struct_ops.__ops_name->sub_attach &&			\
 	    !__COMPAT_struct_has_field("sched_ext_ops", "sub_attach")) {	\
@@ -335,7 +341,8 @@ static inline long scx_hotplug_seq(void)
 
 /*
  * Open a cid-form (struct sched_ext_ops_cid) skeleton. The cid form postdates
- * every op the load-time fix-ups above handle, so none of them apply.
+ * every op the load-time fix-ups above handle except ops.set_numa_node(),
+ * so only that one applies here.
  *
  * A cid-form scheduler registers through bpf_scx_reg_cid() rather than
  * bpf_scx_reg(), so repoint common.bpf.h's prolog probe at it. Both the cid
@@ -346,6 +353,11 @@ static inline long scx_hotplug_seq(void)
 	struct __scx_name *__cskel;						\
 										\
 	__cskel = __SCX_OPS_OPEN(__ops_name, __scx_name, "sched_ext_ops_cid", __opts); \
+	if (__cskel->struct_ops.__ops_name->set_numa_node &&			\
+	    !__COMPAT_struct_has_field("sched_ext_ops_cid", "set_numa_node")) { \
+		fprintf(stderr, "WARNING: kernel doesn't support ops.set_numa_node()\n"); \
+		__cskel->struct_ops.__ops_name->set_numa_node = NULL;		\
+	}									\
 	bpf_program__set_attach_target(__cskel->progs.scx_lib_init_probe, 0,	\
 				       "bpf_scx_reg_cid");			\
 	__cskel;								\
