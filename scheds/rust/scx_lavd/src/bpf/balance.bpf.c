@@ -139,6 +139,27 @@ reset_role:
 	return 0;
 }
 
+/* a stealee compute domain is on the node; read by the NUMA placement path */
+volatile u8 numa_has_stealee[LAVD_NUMA_ID_MAX];
+
+static void update_numa_stealee(void)
+{
+	struct cpdom_ctx *cpdomc;
+	u64 cpdom_id;
+	int nid;
+
+	bpf_for(nid, 0, LAVD_NUMA_ID_MAX)
+		WRITE_ONCE(numa_has_stealee[nid], 0);
+
+	bpf_for(cpdom_id, 0, nr_cpdoms) {
+		if (cpdom_id >= LAVD_CPDOM_MAX_NR)
+			break;
+		cpdomc = MEMBER_VPTR(cpdom_ctxs, [cpdom_id]);
+		if (cpdomc && cpdomc->is_valid && READ_ONCE(cpdomc->is_stealee))
+			WRITE_ONCE(numa_has_stealee[cpdomc->numa_id], 1);
+	}
+}
+
 __weak
 int plan_x_cpdom_migration(void)
 {
@@ -225,6 +246,7 @@ int plan_x_cpdom_migration(void)
 		goto reset_and_skip_lb;
 
 	sys_stat.nr_stealee = nr_stealee;
+	update_numa_stealee();
 
 	return 0;
 
@@ -241,6 +263,7 @@ reset_and_skip_lb:
 			WRITE_ONCE(cpdomc->is_stealee, false);
 		}
 		sys_stat.nr_stealee = 0;
+		update_numa_stealee();
 	}
 	return 0;
 }

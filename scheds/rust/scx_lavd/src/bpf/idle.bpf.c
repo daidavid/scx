@@ -699,6 +699,109 @@ s32 migrate_to_neighbor(struct pick_ctx *ctx, struct cpdom_ctx *cpdc,
 	return cpu;
 }
 
+/*
+ * Interval between two attempts to move a task to its preferred NUMA node:
+ * the task's NUMA scan period / 16, capped at one second, which is what
+ * numa_migrate_preferred() uses for the fair class. The cap alone on a
+ * kernel without the NUMA balancing fields.
+ */
+/* task_struct fields that exist only with CONFIG_NUMA_BALANCING. */
+struct task_struct___numab {
+	unsigned int numa_scan_period;
+} __attribute__((preserve_access_index));
+
+static u64 numa_retry_interval(const struct task_struct *p)
+{
+	const struct task_struct___numab *pn = (const void *)p;
+	u64 interval = LAVD_NUMA_RETRY_MAX_NS;
+
+	if (bpf_core_field_exists(pn->numa_scan_period)) {
+		u64 period_ms = BPF_CORE_READ(pn, numa_scan_period);
+
+		interval = min(interval,
+			       (period_ms * NSEC_PER_MSEC) >> LAVD_NUMA_RETRY_SHIFT);
+	}
+	return interval;
+}
+
+/*
+ * Move @p toward the node the kernel prefers for it, which is where its
+ * memory is. This is numa_migrate_preferred() reduced to its cheap case:
+ * only a fully idle core on that node is taken, nothing is queued or
+ * swapped, a task is considered at most once per retry interval, and only
+ * after a new preference has held for LAVD_NUMA_SETTLE_NS. A task that
+ * finds no idle core stays near its previous CPU and is considered again
+ * at a later pick.
+ */
+static s32 pick_numa_preferred_cpu(struct pick_ctx *ctx, bool *is_idle)
+{
+	task_ctx *taskc = ctx->taskc;
+	struct bpf_cpumask *cpd_mask, *temp;
+	struct cpdom_ctx *cpdomc;
+	struct cpu_ctx *cpuc_cur;
+	volatile u8 *has_stealee;
+	s32 nid = taskc->numa_nid, cpu = -ENOENT;
+	u64 now;
+	int cpdom_id;
+
+	if (!numa_balancing_active() || nid < 0 || nid >= LAVD_NUMA_ID_MAX)
+		return -ENOENT;
+	if (test_task_flag(taskc, LAVD_FLAG_IS_AFFINITIZED))
+		return -ENOENT;
+	if (cpu_to_numa_id(ctx->prev_cpu) == nid)
+		return -ENOENT;
+
+	now = scx_bpf_now();
+	if (time_before(now, taskc->numa_retry_clk))
+		return -ENOENT;
+	taskc->numa_retry_clk = now + numa_retry_interval(ctx->p);
+
+	/*
+	 * Not onto a node the load balancer already finds overloaded: an
+	 * idle core there is momentary, and the task would not be moved
+	 * back. This stands in for the imbalance test of
+	 * task_numa_find_cpu(), reduced to the roles the balancer computes
+	 * every interval.
+	 */
+	has_stealee = MEMBER_VPTR(numa_has_stealee, [nid]);
+	if (!has_stealee || READ_ONCE(*has_stealee))
+		return -ENOENT;
+
+	cpuc_cur = get_cpu_ctx();
+	if (!cpuc_cur)
+		return -ENOENT;
+	temp = cpuc_cur->temp_mask;
+	if (!temp)
+		return -ENOENT;
+
+	/*
+	 * A fully idle core on the preferred node, searched one compute
+	 * domain at a time and in the active set only. The overflow set
+	 * serves pinned work, and a node that core compaction has parked is
+	 * not a place to move a task to.
+	 */
+	bpf_for(cpdom_id, 0, nr_cpdoms) {
+		if (cpdom_id >= LAVD_CPDOM_MAX_NR)
+			break;
+		cpdomc = MEMBER_VPTR(cpdom_ctxs, [cpdom_id]);
+		cpd_mask = MEMBER_VPTR(cpdom_cpumask, [cpdom_id]);
+		if (!cpdomc || !cpd_mask || !cpdomc->is_valid ||
+		    cpdomc->numa_id != nid || !cpdomc->nr_active_cpus)
+			continue;
+
+		bpf_cpumask_and(temp, cast_mask(cpd_mask), cast_mask(ctx->active));
+		cpu = scx_bpf_pick_idle_cpu(cast_mask(temp), SCX_PICK_IDLE_CORE);
+		if (cpu >= 0)
+			break;
+	}
+	if (cpu < 0)
+		return -ENOENT;
+
+	cpuc_cur->nr_numa_mig++;
+	*is_idle = true;
+	return cpu;
+}
+
 __hidden __noinline
 s32 pick_idle_cpu(struct pick_ctx *ctx, bool extend_ovrflw, bool *is_idle)
 {
@@ -781,6 +884,14 @@ s32 pick_idle_cpu(struct pick_ctx *ctx, bool extend_ovrflw, bool *is_idle)
 		goto unlock_out;
 	}
 	/* NOTE: Now task @p is not a per-CPU task. */
+
+	/*
+	 * NUMA balancing: move toward the node the kernel prefers for @p
+	 * before anything anchors @p to its previous CPU.
+	 */
+	cpu = pick_numa_preferred_cpu(ctx, is_idle);
+	if (cpu >= 0)
+		goto unlock_out;
 
 	/*
 	 * Warm-CPU preference: Prefer the previous CPU while its cache and TLB
