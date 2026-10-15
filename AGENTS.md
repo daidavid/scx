@@ -19,10 +19,9 @@ tree.
   `[package.metadata.scx]`.
 - cid-form schedulers need clang 22 or newer. scx_cargo refuses to build
   them with an older one.
-- Editing a header under scheds/include rebuilds the BPF objects, because
-  scx_cargo's build script registers those files with cargo. Replacing
-  rust/scx_utils/vmlinux.tar.zst does not, so run `cargo clean` after a
-  vmlinux.h update.
+- Editing a header under scheds/include or replacing
+  rust/scx_utils/vmlinux.tar.zst rebuilds the BPF objects, because
+  scx_cargo's build script registers those files with cargo.
 - Before each commit, run `cargo fmt` and `cargo build`, and check `git diff
   --cached --stat` so that only the intended files are staged. Before a pull
   request, `cargo build`, `cargo fmt -- --check` and `cargo test` must pass.
@@ -220,8 +219,8 @@ so check .config for both.
    types the update was for, that the dumps really are per architecture
    (pt_regs has r15 on x86 and regs[31] on arm64), and that struct cpumask
    has `long unsigned int bits[128]`.
-6. Run `cargo clean`, since cached BPF objects keep the old vmlinux.h, then
-   `cargo build`, `cargo test` and `make -C lib/selftests/compat test`. A
+6. Run `cargo build`, `cargo test` and `make -C lib/selftests/compat test`;
+   the tarball change alone makes cargo rebuild the BPF objects. A
    -Wmissing-declarations warning from vmlinux.h means a dump lost its
    pragma wrapping. common.bpf.h defines BPF_NO_KFUNC_PROTOTYPES, so a
    conflicting-type error from a kfunc whose signature changed comes from a
