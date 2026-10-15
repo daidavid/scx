@@ -45291,6 +45291,7 @@ struct sched_ext_ops {
 	bool (*yield)(struct task_struct *, struct task_struct *);
 	bool (*core_sched_before)(struct task_struct *, struct task_struct *);
 	void (*set_weight)(struct task_struct *, u32);
+	void (*set_numa_node)(struct task_struct *, s32);
 	void (*set_cpumask)(struct task_struct *, const struct cpumask *);
 	void (*update_idle)(s32, bool);
 	s32 (*init_task)(struct task_struct *, struct scx_init_task_args *);
@@ -45367,6 +45368,7 @@ struct sched_ext_ops_cid {
 	bool (*yield)(struct task_struct *, struct task_struct *);
 	bool (*core_sched_before)(struct task_struct *, struct task_struct *);
 	void (*set_weight)(struct task_struct *, u32);
+	void (*set_numa_node)(struct task_struct *, s32);
 	void (*set_cmask)(struct task_struct *, const struct scx_cmask *);
 	void (*update_idle)(s32, bool);
 	s32 (*init_task)(struct task_struct *, struct scx_init_task_args *);
