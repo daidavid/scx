@@ -134,6 +134,7 @@ enum consts_internal {
 	LAVD_LB_NEAR_DIST		= 1,	/* force stealing scans only the nearest distance */
 	LAVD_FORCE_STEAL_BACKOFF_NS	= 1000000ULL,	/* 1 ms */
 
+	LAVD_NUMA_SETTLE_NS		= LAVD_TIME_ONE_SEC, /* a changed preferred node is acted on once it held this long */
 	LAVD_NUMA_RETRY_MAX_NS		= LAVD_TIME_ONE_SEC, /* cap of the interval between moves toward the preferred node */
 	LAVD_NUMA_RETRY_SHIFT		= 4, /* the interval is the task's NUMA scan period / 16, as in the fair class */
 
@@ -607,6 +608,7 @@ extern const volatile u8	verbose;
 extern const volatile u8	numa_balancing; /* preferred NUMA nodes are recorded */
 extern volatile u8		numa_balancing_on; /* kernel.numa_balancing is on */
 extern volatile u32		numa_cap_active[LAVD_NUMA_ID_MAX]; /* capacity of the node's active CPUs */
+extern volatile u8		numa_has_stealee[LAVD_NUMA_ID_MAX]; /* a stealee cpdom is on the node */
 
 /* Whether preferred NUMA nodes are recorded and are to be acted on. */
 static inline bool numa_balancing_active(void)

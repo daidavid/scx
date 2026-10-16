@@ -155,15 +155,18 @@ reset_role:
 }
 
 /*
- * Per-node summary for the NUMA placement paths, refreshed every interval:
- * the capacity of the node's active CPUs. A parked or offlined domain is
- * left out; the domain mask is kept up to date on hotplug even when core
- * compaction is off and the active counts are not. Summed into a temporary
- * first, so that a reader sees a node's old or new value and never a
- * partial sum.
+ * Per-node summaries for the NUMA placement paths, refreshed every
+ * interval: the capacity of the node's active CPUs and whether one of its
+ * domains is a stealee this round. A parked or offlined domain is left
+ * out; the domain mask is kept up to date on hotplug even when core
+ * compaction is off and the active counts are not. Summed into the
+ * temporaries first, so that a reader sees a node's old or new value and
+ * never a partial sum.
  */
 volatile u32 numa_cap_active[LAVD_NUMA_ID_MAX];
+volatile u8 numa_has_stealee[LAVD_NUMA_ID_MAX];
 static u32 numa_cap_active_tmp[LAVD_NUMA_ID_MAX];
+static u8 numa_has_stealee_tmp[LAVD_NUMA_ID_MAX];
 static volatile u32 numa_summary_busy;
 
 __hidden
@@ -177,8 +180,10 @@ void update_numa_summary(void)
 	if (__sync_val_compare_and_swap(&numa_summary_busy, 0, 1))
 		return;
 
-	bpf_for(nid, 0, LAVD_NUMA_ID_MAX)
+	bpf_for(nid, 0, LAVD_NUMA_ID_MAX) {
 		numa_cap_active_tmp[nid] = 0;
+		numa_has_stealee_tmp[nid] = 0;
+	}
 
 	bpf_rcu_read_lock();
 	bpf_for(cpdom_id, 0, nr_cpdoms) {
@@ -193,11 +198,15 @@ void update_numa_summary(void)
 		    bpf_cpumask_empty(cast_mask(cpd_mask)))
 			continue;
 		numa_cap_active_tmp[cpdomc->numa_id] += READ_ONCE(cpdomc->cap_sum_active_cpus);
+		if (READ_ONCE(cpdomc->is_stealee))
+			numa_has_stealee_tmp[cpdomc->numa_id] = 1;
 	}
 	bpf_rcu_read_unlock();
 
-	bpf_for(nid, 0, LAVD_NUMA_ID_MAX)
+	bpf_for(nid, 0, LAVD_NUMA_ID_MAX) {
 		WRITE_ONCE(numa_cap_active[nid], numa_cap_active_tmp[nid]);
+		WRITE_ONCE(numa_has_stealee[nid], numa_has_stealee_tmp[nid]);
+	}
 
 	WRITE_ONCE(numa_summary_busy, 0);
 }

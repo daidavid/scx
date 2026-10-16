@@ -2217,22 +2217,40 @@ void BPF_STRUCT_OPS(lavd_set_cpumask, struct task_struct *p,
 
 /*
  * Record the node the kernel's NUMA balancing prefers for a task. The
- * placement paths act on it at the task's next CPU pick.
+ * placement paths act on a first preference at the task's next CPU pick
+ * and on a changed one once it has held for LAVD_NUMA_SETTLE_NS.
  */
 static void set_task_numa_nid(task_ctx *taskc, s32 nid)
 {
 	if (nid < 0 || nid >= LAVD_NUMA_ID_MAX)
 		nid = NUMA_NO_NODE;
+
+	/*
+	 * A repeat, not a change: the report after each ops.enable() can
+	 * name the node already recorded, for a new thread, at attach and
+	 * whenever the task comes back to the class.
+	 */
+	if (taskc->numa_nid == nid)
+		return;
+
+	/*
+	 * A first preference, including the one a new thread inherits, is
+	 * acted on at the next pick. A changed preference holds for a while
+	 * first: the fair class acts at once, but a move across nodes is
+	 * paid twice when the preference flips back.
+	 */
+	if (taskc->numa_nid != NUMA_NO_NODE)
+		taskc->numa_retry_clk = scx_bpf_now() + LAVD_NUMA_SETTLE_NS;
 	taskc->numa_nid = nid;
 }
 
 /*
  * sched_setnuma() is where the kernel's NUMA balancing stores the node it
  * prefers for a task, under the task's rq lock inside a dequeue and
- * enqueue cycle. Mirror the value into the task context; the placement
- * paths act on it at the task's next CPU pick. The kernel calls it for the
- * task that took the hinting fault, so @p is current, which is the trusted
- * pointer the context lookup needs.
+ * enqueue cycle. Mirror the value into the task context for the placement
+ * paths, see set_task_numa_nid(). The kernel calls it for the task that
+ * took the hinting fault, so @p is current, which is the trusted pointer
+ * the context lookup needs.
  */
 SEC("?fentry/sched_setnuma")
 int BPF_PROG(fentry_sched_setnuma, struct task_struct *p, int nid)
