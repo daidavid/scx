@@ -202,8 +202,10 @@ struct Opts {
     /// Do not follow the kernel's NUMA balancing. By default, on a kernel
     /// built with NUMA balancing, on a machine with more than one node and
     /// with kernel.numa_balancing on, the scheduler records the node the
-    /// kernel prefers for each task and places the task by it while the
-    /// sysctl stays on.
+    /// kernel prefers for each task, through ops.set_numa_node() where the
+    /// kernel has it, which also enables the kernel's hinting-fault scan
+    /// for the scheduler's tasks, and from the task_struct otherwise, and
+    /// places the task by it while the sysctl stays on.
     #[clap(long = "no-numa-balancing", action = clap::ArgAction::SetTrue)]
     no_numa_balancing: bool,
 
@@ -765,11 +767,15 @@ impl<'a> Scheduler<'a> {
     }
 
     /// Mirror the node the kernel's NUMA balancing picks for a task into
-    /// the task context as it changes. sched_setnuma() is the one place
-    /// the kernel stores it. The probe is an fentry program, which needs
-    /// the function tracer; without it the node read at task init stands.
+    /// the task context as it changes, on a kernel without
+    /// ops.set_numa_node(). sched_setnuma() is the one place the kernel
+    /// stores it. The probe is an fentry program, which needs the function
+    /// tracer; without it the node read at task init stands.
     fn attach_numa_probe(skel: &mut OpenBpfSkel) -> Result<bool> {
         if skel.maps.rodata_data.as_ref().unwrap().numa_balancing == 0 {
+            return Ok(false);
+        }
+        if !skel.struct_ops.lavd_ops_mut().set_numa_node.is_null() {
             return Ok(false);
         }
         if !compat::tracer_available("function")? {
@@ -832,9 +838,25 @@ impl<'a> Scheduler<'a> {
         rodata.numa_balancing = numa_balancing as u8;
         rodata.nr_numa_nodes = order.nr_numa as u32;
         bss_data.numa_balancing_on = numa_balancing as u8;
+
+        // On a kernel that reports preferred nodes through
+        // ops.set_numa_node(), the callback replaces the sched_setnuma()
+        // probe and the kernel drives the hinting-fault scan for our tasks.
+        // Leave it unset otherwise, and when not taking part, so that no
+        // scan runs.
+        let numa_ops = compat::struct_has_field("sched_ext_ops", "set_numa_node").unwrap_or(false);
+        if !(numa_balancing && numa_ops) {
+            skel.struct_ops.lavd_ops_mut().set_numa_node = std::ptr::null_mut();
+        }
         info!(
             "NUMA balancing: {}",
-            if numa_balancing { "on" } else { "off" }
+            if !numa_balancing {
+                "off"
+            } else if numa_ops {
+                "on, through ops.set_numa_node()"
+            } else {
+                "on, through the sched_setnuma() probe"
+            }
         );
 
         // Fail hard if cpu.max was explicitly requested but the kernel lacks
