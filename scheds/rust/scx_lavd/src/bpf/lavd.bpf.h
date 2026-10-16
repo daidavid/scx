@@ -125,6 +125,9 @@ enum consts_internal {
 	LAVD_CPDOM_MIG_PROB_FT		= (LAVD_SYS_STAT_INTERVAL_NS / LAVD_SLICE_MAX_NS_DFL), /* roughly twice per interval */
 	LAVD_CPU_CONGESTED_THRES	= 1, /* the CPU is congested when one or more tasks are waiting across its DSQs */
 
+	LAVD_NUMA_RETRY_MAX_NS		= LAVD_TIME_ONE_SEC, /* cap of the interval between moves toward the preferred node */
+	LAVD_NUMA_RETRY_SHIFT		= 4, /* the interval is the task's NUMA scan period / 16, as in the fair class */
+
 	LAVD_FUTEX_OP_INVALID		= -1,
 };
 
@@ -251,6 +254,7 @@ struct task_ctx {
 	u32	queued_load_snapshot_cpu; /* task_load_metric() value snapshotted at enqueue time for the per-CPU counter */
 	pid_t	pid;			/* pid for this task */
 	pid_t	waker_pid;		/* last waker's PID */
+	u64	numa_retry_clk;		/* earliest time to try a move to the preferred NUMA node */
 
 	/* --- cacheline 5 boundary (320 bytes): ravg/util read-mostly group --- */
 	u32	util_est __attribute__((aligned(CACHELINE_SIZE)));
@@ -515,7 +519,7 @@ struct cpu_ctx {
 	u32		avg_perf_factor;
 	volatile u32	max_freq_observed; /* maximum CPU frequency observed within an interval scaled to 1024 */
 	volatile u32	max_freq;	/* maximum CPU frequency averaged across multiple intervals */
-	u32		__pad2;
+	volatile u32	nr_numa_mig;	/* picks that moved a task to its preferred NUMA node */
 	/*
 	 * Snapshot of scx_clock_task() taken at the end of the last
 	 * collect_sys_stat() interval. scx_clock_task() advances during tasks
@@ -770,6 +774,7 @@ u32 preemption_vulnerability(u16 normalized_lat_cri, u32 util_est)
 /* task_struct fields that exist only with CONFIG_NUMA_BALANCING. */
 struct task_struct___numab {
 	int numa_preferred_nid;
+	unsigned int numa_scan_period;
 } __attribute__((preserve_access_index));
 
 /*
@@ -787,6 +792,23 @@ static inline s32 kernel_numa_nid(const struct task_struct *p)
 	if (nid < 0 || nid >= LAVD_NUMA_ID_MAX)
 		nid = NUMA_NO_NODE;
 	return nid;
+}
+
+/*
+ * NUMA node of @cpu, taken from its compute domain. NUMA_NO_NODE when
+ * @cpu has no context.
+ */
+static inline s32 cpu_to_numa_id(s32 cpu)
+{
+	struct cpu_ctx *cpuc = get_cpu_ctx_id(cpu);
+	struct cpdom_ctx *cpdomc;
+
+	if (!cpuc)
+		return NUMA_NO_NODE;
+	cpdomc = MEMBER_VPTR(cpdom_ctxs, [cpuc->cpdom_id]);
+	if (!cpdomc)
+		return NUMA_NO_NODE;
+	return cpdomc->numa_id;
 }
 
 /*

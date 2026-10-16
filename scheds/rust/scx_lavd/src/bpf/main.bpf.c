@@ -2297,6 +2297,7 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(lavd_init_task, struct task_struct *p,
 			bpf_rcu_read_unlock();
 		}
 	}
+	taskc->numa_retry_clk = 0;
 
 	bpf_rcu_read_lock();
 	set_affinity_flags(taskc, p->cpus_ptr);
