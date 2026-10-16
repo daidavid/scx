@@ -134,6 +134,9 @@ enum consts_internal {
 	LAVD_LB_NEAR_DIST		= 1,	/* force stealing scans only the nearest distance */
 	LAVD_FORCE_STEAL_BACKOFF_NS	= 1000000ULL,	/* 1 ms */
 
+	LAVD_NUMA_RETRY_MAX_NS		= LAVD_TIME_ONE_SEC, /* cap of the interval between moves toward the preferred node */
+	LAVD_NUMA_RETRY_SHIFT		= 4, /* the interval is the task's NUMA scan period / 16, as in the fair class */
+
 	LAVD_FUTEX_OP_INVALID		= -1,
 };
 
@@ -261,6 +264,7 @@ struct task_ctx {
 	u64	queued_svc_snapshot_cpu; /* avg_runtime_invr snapshotted at enqueue time for the per-CPU counter */
 	pid_t	pid;			/* pid for this task */
 	pid_t	waker_pid;		/* last waker's PID */
+	u64	numa_retry_clk;		/* earliest time to try a move to the preferred NUMA node */
 
 	/* --- cacheline 5 boundary (320 bytes): ravg/util read-mostly group --- */
 	u32	util_est __attribute__((aligned(CACHELINE_SIZE)));
@@ -840,6 +844,7 @@ u32 preemption_vulnerability(u16 normalized_lat_cri, u32 util_est)
 /* task_struct fields that exist only with CONFIG_NUMA_BALANCING. */
 struct task_struct___numab {
 	int numa_preferred_nid;
+	unsigned int numa_scan_period;
 } __attribute__((preserve_access_index));
 
 /*
@@ -857,6 +862,23 @@ static inline s32 kernel_numa_nid(const struct task_struct *p)
 	if (nid < 0 || nid >= LAVD_NUMA_ID_MAX)
 		nid = NUMA_NO_NODE;
 	return nid;
+}
+
+/*
+ * NUMA node of @cpu, taken from its compute domain. NUMA_NO_NODE when
+ * @cpu has no context.
+ */
+static inline s32 cpu_to_numa_id(s32 cpu)
+{
+	struct cpu_ctx *cpuc = get_cpu_ctx_id(cpu);
+	struct cpdom_ctx *cpdomc;
+
+	if (!cpuc)
+		return NUMA_NO_NODE;
+	cpdomc = MEMBER_VPTR(cpdom_ctxs, [cpuc->cpdom_id]);
+	if (!cpdomc)
+		return NUMA_NO_NODE;
+	return cpdomc->numa_id;
 }
 
 /*
