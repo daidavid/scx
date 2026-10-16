@@ -2147,6 +2147,17 @@ static void set_task_numa_nid(task_ctx *taskc, s32 nid)
 {
 	if (nid < 0 || nid >= LAVD_NUMA_ID_MAX)
 		nid = NUMA_NO_NODE;
+	if (taskc->numa_nid == nid)
+		return;
+
+	/*
+	 * A first preference, including the one a new thread inherits, is
+	 * acted on at the next pick. A changed preference holds for a while
+	 * first: the fair class acts at once, but a move across nodes is
+	 * paid twice when the preference flips back.
+	 */
+	if (taskc->numa_nid != NUMA_NO_NODE)
+		taskc->numa_retry_clk = scx_bpf_now() + LAVD_NUMA_SETTLE_NS;
 	taskc->numa_nid = nid;
 }
 

@@ -125,6 +125,7 @@ enum consts_internal {
 	LAVD_CPDOM_MIG_PROB_FT		= (LAVD_SYS_STAT_INTERVAL_NS / LAVD_SLICE_MAX_NS_DFL), /* roughly twice per interval */
 	LAVD_CPU_CONGESTED_THRES	= 1, /* the CPU is congested when one or more tasks are waiting across its DSQs */
 
+	LAVD_NUMA_SETTLE_NS		= LAVD_TIME_ONE_SEC, /* a changed preferred node is acted on once it held this long */
 	LAVD_NUMA_RETRY_MAX_NS		= LAVD_TIME_ONE_SEC, /* cap of the interval between moves toward the preferred node */
 	LAVD_NUMA_RETRY_SHIFT		= 4, /* the interval is the task's NUMA scan period / 16, as in the fair class */
 
@@ -590,6 +591,7 @@ extern volatile u8		numa_balancing_on; /* kernel.numa_balancing is on */
 extern const volatile u32	nr_numa_nodes; /* number of NUMA nodes that have CPUs */
 extern volatile u64		numa_load_invr[LAVD_NUMA_ID_MAX]; /* load of the node's active compute domains */
 extern volatile u32		numa_cap_active[LAVD_NUMA_ID_MAX]; /* capacity of the node's active CPUs */
+extern volatile u8		numa_has_stealee[LAVD_NUMA_ID_MAX]; /* a stealee cpdom is on the node */
 
 /* Whether preferred NUMA nodes are recorded and are to be acted on. */
 static inline bool numa_balancing_active(void)

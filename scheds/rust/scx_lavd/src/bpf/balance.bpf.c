@@ -141,16 +141,18 @@ reset_role:
 
 /*
  * Per-node summaries for the NUMA placement paths, refreshed every
- * interval: the load of the node's active compute domains and the
- * capacity of their active CPUs. A parked or offlined domain is left
- * out: its load is stale and its capacity is gone. Summed into the
- * temporaries first, so that a reader sees a node's old or new value and
- * never a partial sum.
+ * interval: the load of the node's active compute domains, the capacity
+ * of their active CPUs, and whether one of them is a stealee this round.
+ * A parked or offlined domain is left out: its load is stale and its
+ * capacity is gone. Summed into the temporaries first, so that a reader
+ * sees a node's old or new value and never a partial sum.
  */
 volatile u64 numa_load_invr[LAVD_NUMA_ID_MAX];
 volatile u32 numa_cap_active[LAVD_NUMA_ID_MAX];
+volatile u8 numa_has_stealee[LAVD_NUMA_ID_MAX];
 static u64 numa_load_invr_tmp[LAVD_NUMA_ID_MAX];
 static u32 numa_cap_active_tmp[LAVD_NUMA_ID_MAX];
+static u8 numa_has_stealee_tmp[LAVD_NUMA_ID_MAX];
 static volatile u32 numa_summary_busy;
 
 __hidden
@@ -167,6 +169,7 @@ void update_numa_summary(void)
 	bpf_for(nid, 0, LAVD_NUMA_ID_MAX) {
 		numa_load_invr_tmp[nid] = 0;
 		numa_cap_active_tmp[nid] = 0;
+		numa_has_stealee_tmp[nid] = 0;
 	}
 
 	bpf_rcu_read_lock();
@@ -188,12 +191,15 @@ void update_numa_summary(void)
 			continue;
 		numa_load_invr_tmp[cpdomc->numa_id] += READ_ONCE(cpdomc->load_invr);
 		numa_cap_active_tmp[cpdomc->numa_id] += READ_ONCE(cpdomc->cap_sum_active_cpus);
+		if (READ_ONCE(cpdomc->is_stealee))
+			numa_has_stealee_tmp[cpdomc->numa_id] = 1;
 	}
 	bpf_rcu_read_unlock();
 
 	bpf_for(nid, 0, LAVD_NUMA_ID_MAX) {
 		WRITE_ONCE(numa_load_invr[nid], numa_load_invr_tmp[nid]);
 		WRITE_ONCE(numa_cap_active[nid], numa_cap_active_tmp[nid]);
+		WRITE_ONCE(numa_has_stealee[nid], numa_has_stealee_tmp[nid]);
 	}
 
 	WRITE_ONCE(numa_summary_busy, 0);

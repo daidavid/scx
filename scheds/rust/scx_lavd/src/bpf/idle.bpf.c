@@ -760,9 +760,10 @@ static u64 numa_retry_interval(const struct task_struct *p)
  * Move @p toward the node the kernel prefers for it, which is where its
  * memory is. This is numa_migrate_preferred() reduced to its cheap case:
  * only a fully idle core on that node is taken, nothing is queued or
- * swapped, and a task is considered at most once per retry interval. A
- * task that finds no idle core stays near its previous CPU and is
- * considered again at a later pick.
+ * swapped, a task is considered at most once per retry interval, and only
+ * after a new preference has held for LAVD_NUMA_SETTLE_NS. A task that
+ * finds no idle core stays near its previous CPU and is considered again
+ * at a later pick.
  */
 static s32 pick_numa_preferred_cpu(struct pick_ctx *ctx, bool *is_idle)
 {
@@ -770,6 +771,8 @@ static s32 pick_numa_preferred_cpu(struct pick_ctx *ctx, bool *is_idle)
 	struct bpf_cpumask *cpd_mask, *temp;
 	struct cpdom_ctx *cpdomc;
 	struct cpu_ctx *cpuc_cur;
+	volatile u8 *has_stealee;
+	bool exec;
 	s32 nid = taskc->numa_nid, cpu = -ENOENT;
 	u64 now, pick_flags;
 	int cpdom_id;
@@ -785,6 +788,21 @@ static s32 pick_numa_preferred_cpu(struct pick_ctx *ctx, bool *is_idle)
 	if (time_before(now, taskc->numa_retry_clk))
 		return -ENOENT;
 	taskc->numa_retry_clk = now + numa_retry_interval(ctx->p);
+	exec = test_task_flag(taskc, LAVD_FLAG_NUMA_EXEC);
+
+	/*
+	 * Not onto a node the load balancer already finds overloaded: an
+	 * idle core there is momentary, and the task would not be moved
+	 * back. This stands in for the imbalance test of
+	 * task_numa_find_cpu(), reduced to the roles the balancer computes
+	 * every interval. A task placed at exec is exempt: its node was
+	 * chosen by load, and it has no footprint to protect.
+	 */
+	if (!exec) {
+		has_stealee = MEMBER_VPTR(numa_has_stealee, [nid]);
+		if (!has_stealee || READ_ONCE(*has_stealee))
+			return -ENOENT;
+	}
 
 	cpuc_cur = get_cpu_ctx();
 	if (!cpuc_cur)
@@ -800,7 +818,7 @@ static s32 pick_numa_preferred_cpu(struct pick_ctx *ctx, bool *is_idle)
 	 * set serves pinned work, and a node that core compaction has parked
 	 * is not a place to move a task to.
 	 */
-	pick_flags = test_task_flag(taskc, LAVD_FLAG_NUMA_EXEC) ? 0 : SCX_PICK_IDLE_CORE;
+	pick_flags = exec ? 0 : SCX_PICK_IDLE_CORE;
 	bpf_for(cpdom_id, 0, nr_cpdoms) {
 		if (cpdom_id >= LAVD_CPDOM_MAX_NR)
 			break;
