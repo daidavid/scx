@@ -2250,6 +2250,28 @@ int BPF_PROG(fentry_sched_setnuma, struct task_struct *p, int nid)
 	return 0;
 }
 
+/*
+ * On a kernel with ops.set_numa_node() the kernel reports the node itself,
+ * under @p's rq lock: the current one after every ops.enable(), and then
+ * each new one from sched_setnuma(), after the store and before @p is
+ * queued again. It reports a change only when the node differs from the
+ * previous one and @p is enabled. Implementing the callback also makes the
+ * sched_ext tick drive the hinting-fault scan for lavd's tasks, so the
+ * node stays current while they run under lavd.
+ */
+void BPF_STRUCT_OPS(lavd_set_numa_node, struct task_struct *p, s32 nid)
+{
+	task_ctx *taskc;
+
+	taskc = get_task_ctx(p);
+	if (!taskc) {
+		scx_bpf_error("task_ctx_stor first lookup failed");
+		return;
+	}
+
+	set_task_numa_nid(taskc, nid);
+}
+
 void BPF_STRUCT_OPS(lavd_cpu_release, s32 cpu,
 		    struct scx_cpu_release_args *args)
 {
@@ -2445,10 +2467,14 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(lavd_init_task, struct task_struct *p,
 	 * under the fair class, taken when the scheduler attaches. At fork the
 	 * kernel hands every CLONE_VM child its parent's node, threads and
 	 * vfork or posix_spawn children alike, and exec does not clear it;
-	 * under lavd nothing would correct it once the child execs into a new
-	 * address space. So a new process starts without a node and a thread
-	 * takes the node of the thread creating it, as lavd knows it. The
-	 * sched_setnuma() probe follows later changes.
+	 * without the scan nothing would correct it once the child execs into
+	 * a new address space. So a new process starts without a node and a
+	 * thread takes the node of the thread creating it, as lavd knows it.
+	 * With ops.set_numa_node() the kernel then reports its own value, the
+	 * inherited one included, and the scan corrects it once @p takes
+	 * hinting faults; a single-threaded task whose memory is private and
+	 * all on the node it runs on takes none and keeps the inherited node.
+	 * Otherwise the sched_setnuma() probe follows later changes.
 	 */
 	taskc->numa_nid = NUMA_NO_NODE;
 	if (numa_balancing) {
@@ -3132,6 +3158,7 @@ SCX_OPS_DEFINE(lavd_ops,
 	       .cpu_offline		= (void *)lavd_cpu_offline,
 	       .update_idle		= (void *)lavd_update_idle,
 	       .set_cpumask		= (void *)lavd_set_cpumask,
+	       .set_numa_node		= (void *)lavd_set_numa_node,
 	       .cpu_release		= (void *)lavd_cpu_release,
 	       .enable			= (void *)lavd_enable,
 	       .init_task		= (void *)lavd_init_task,
