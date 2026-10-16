@@ -220,7 +220,8 @@ struct Opts {
     /// Do not follow the kernel's NUMA balancing. By default, on a kernel
     /// built with NUMA balancing, on a machine with more than one node and
     /// with kernel.numa_balancing on when the scheduler starts, the
-    /// scheduler records the node the kernel prefers for each task.
+    /// scheduler records the node the kernel prefers for each task and
+    /// places the task by it while the sysctl stays on.
     #[clap(long = "no-numa-balancing", action = clap::ArgAction::SetTrue)]
     no_numa_balancing: bool,
 
