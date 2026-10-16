@@ -234,6 +234,20 @@ const volatile u8	no_ovrflw_extend;
 const volatile u64	warm_cpu_ns = 0;
 
 /*
+ * Preferred NUMA nodes are recorded: the kernel is built with NUMA
+ * balancing, the machine has more than one node and the user did not opt
+ * out.
+ */
+const volatile u8	numa_balancing = 0;
+
+/*
+ * kernel.numa_balancing is on, followed at run time by userspace. With it
+ * off the kernel no longer updates preferred nodes, so they are not acted
+ * on.
+ */
+volatile u8		numa_balancing_on = 0;
+
+/*
  * Skip periodic load balancing when average system utilization is below this
  * threshold. The value is pre-scaled by userspace. 0 = disabled.
  * Default: p2s(25) = 256.
@@ -2089,6 +2103,41 @@ void BPF_STRUCT_OPS(lavd_set_cpumask, struct task_struct *p,
 	set_affinity_flags(taskc, cpumask);
 }
 
+/*
+ * Record the node the kernel's NUMA balancing prefers for a task. The
+ * placement paths act on it at the task's next CPU pick.
+ */
+static void set_task_numa_nid(task_ctx *taskc, s32 nid)
+{
+	if (nid < 0 || nid >= LAVD_NUMA_ID_MAX)
+		nid = NUMA_NO_NODE;
+	taskc->numa_nid = nid;
+}
+
+/*
+ * sched_setnuma() is where the kernel's NUMA balancing stores the node it
+ * prefers for a task, under the task's rq lock inside a dequeue and
+ * enqueue cycle. Mirror the value into the task context; the placement
+ * paths act on it at the task's next CPU pick. The kernel calls it for the
+ * task that took the hinting fault, so @p is current, which is the trusted
+ * pointer the context lookup needs.
+ */
+SEC("?fentry/sched_setnuma")
+int BPF_PROG(fentry_sched_setnuma, struct task_struct *p, int nid)
+{
+	struct task_struct *cur = bpf_get_current_task_btf();
+	task_ctx *taskc;
+
+	if ((u64)p != (u64)cur)
+		return 0;
+	taskc = find_task_ctx(cur);
+	if (!taskc)
+		return 0;
+
+	set_task_numa_nid(taskc, nid);
+	return 0;
+}
+
 void BPF_STRUCT_OPS(lavd_cpu_release, s32 cpu,
 		    struct scx_cpu_release_args *args)
 {
@@ -2223,6 +2272,31 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(lavd_init_task, struct task_struct *p,
 	/* Per-CPU warmth is task+CPU private -- never inherit it. */
 	taskc->cpu_heat = 0;
 	taskc->last_stopping_clk = scx_bpf_now();
+
+	/*
+	 * The node the kernel's NUMA balancing settled on for @p while it ran
+	 * under the fair class, taken when the scheduler attaches. At fork the
+	 * kernel hands every CLONE_VM child its parent's node, threads and
+	 * vfork or posix_spawn children alike, and exec does not clear it;
+	 * under lavd nothing would correct it once the child execs into a new
+	 * address space. So a new process starts without a node and a thread
+	 * takes the node of the thread creating it, as lavd knows it. The
+	 * sched_setnuma() probe follows later changes.
+	 */
+	taskc->numa_nid = NUMA_NO_NODE;
+	if (numa_balancing) {
+		if (!args->fork) {
+			taskc->numa_nid = kernel_numa_nid(p);
+		} else if (p->pid != p->tgid) {
+			task_ctx *taskc_cur;
+
+			bpf_rcu_read_lock();
+			taskc_cur = find_task_ctx(bpf_get_current_task_btf());
+			if (taskc_cur)
+				taskc->numa_nid = taskc_cur->numa_nid;
+			bpf_rcu_read_unlock();
+		}
+	}
 
 	bpf_rcu_read_lock();
 	set_affinity_flags(taskc, p->cpus_ptr);

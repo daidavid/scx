@@ -220,7 +220,8 @@ struct task_ctx {
 	volatile u32	cpdom_id;		/* chosen compute domain id at ops.enqueue() */
 	volatile u32	suggested_cpu_id;	/* suggested CPU ID at ops.enqueue() and ops.select_cpu() */
 	volatile s32	pinned_cpu_id;		/* pinned CPU id. -ENOENT if not pinned or not runnable. */
-	u32	__pad0;
+	s16	numa_nid;		/* NUMA node the kernel's NUMA balancing prefers, NUMA_NO_NODE if none */
+	u8	__pad0[2];
 	u64	last_running_clk;	/* last time when scheduled in */
 	u64	run_freq;		/* scheduling frequency in a second */
 	u64	wait_freq;		/* waiting frequency in a second */
@@ -578,6 +579,14 @@ extern const volatile u8	cpu_turbo[LAVD_CPU_ID_MAX];
 extern const volatile bool	no_wake_sync;
 extern const volatile bool	no_slice_boost;
 extern const volatile u8	verbose;
+extern const volatile u8	numa_balancing; /* preferred NUMA nodes are recorded */
+extern volatile u8		numa_balancing_on; /* kernel.numa_balancing is on */
+
+/* Whether preferred NUMA nodes are recorded and are to be acted on. */
+static inline bool numa_balancing_active(void)
+{
+	return numa_balancing && READ_ONCE(numa_balancing_on);
+}
 
 #define debugln(fmt, ...)						\
 ({									\
@@ -756,6 +765,28 @@ u32 preemption_vulnerability(u16 normalized_lat_cri, u32 util_est)
 	u32 lat_step = normalized_lat_cri / LAVD_VULN_THRESH_STEP_SIZE;
 	u32 util_step = util_est / LAVD_VULN_THRESH_STEP_SIZE;
 	return lat_step * LAVD_VULN_THRESH_UTIL_STEPS + util_step;
+}
+
+/* task_struct fields that exist only with CONFIG_NUMA_BALANCING. */
+struct task_struct___numab {
+	int numa_preferred_nid;
+} __attribute__((preserve_access_index));
+
+/*
+ * The node the kernel's NUMA balancing prefers for @p, which is the node
+ * holding most of the memory @p faulted on. NUMA_NO_NODE when the kernel
+ * has none for @p or was built without NUMA balancing.
+ */
+static inline s32 kernel_numa_nid(const struct task_struct *p)
+{
+	const struct task_struct___numab *pn = (const void *)p;
+	s32 nid = NUMA_NO_NODE;
+
+	if (bpf_core_field_exists(pn->numa_preferred_nid))
+		nid = BPF_CORE_READ(pn, numa_preferred_nid);
+	if (nid < 0 || nid >= LAVD_NUMA_ID_MAX)
+		nid = NUMA_NO_NODE;
+	return nid;
 }
 
 /*

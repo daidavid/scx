@@ -199,6 +199,14 @@ struct Opts {
     #[clap(long = "no-use-em", action = clap::ArgAction::SetTrue)]
     no_use_em: bool,
 
+    /// Do not follow the kernel's NUMA balancing. By default, on a kernel
+    /// built with NUMA balancing, on a machine with more than one node and
+    /// with kernel.numa_balancing on, the scheduler records the node the
+    /// kernel prefers for each task and places the task by it while the
+    /// sysctl stays on.
+    #[clap(long = "no-numa-balancing", action = clap::ArgAction::SetTrue)]
+    no_numa_balancing: bool,
+
     /// Do not boost futex holders.
     #[clap(long = "no-futex-boost", action = clap::ArgAction::SetTrue)]
     no_futex_boost: bool,
@@ -538,6 +546,7 @@ impl<'a> Scheduler<'a> {
 
         // Initialize skel according to @opts.
         Self::init_globals(&mut skel, opts, &order, debug_level)?;
+        Self::attach_numa_probe(&mut skel)?;
 
         // Mirror the cpu.max caps into rodata so the BPF admission gates match
         // the map sizes set just below.
@@ -720,6 +729,45 @@ impl<'a> Scheduler<'a> {
         }
     }
 
+    /// Whether kernel.numa_balancing has NUMA_BALANCING_NORMAL set, which is
+    /// what drives the hinting-fault scan the preferred node comes from.
+    fn numa_balancing_sysctl_on() -> bool {
+        std::fs::read_to_string("/proc/sys/kernel/numa_balancing")
+            .ok()
+            .and_then(|s| s.trim().parse::<u32>().ok())
+            .is_some_and(|mode| mode & 1 != 0)
+    }
+
+    /// Follow kernel.numa_balancing at run time. With it off the kernel
+    /// stops updating preferred nodes, so the frozen ones must not be
+    /// acted on.
+    fn refresh_numa_balancing(&mut self) {
+        if self.skel.maps.rodata_data.as_ref().unwrap().numa_balancing == 0 {
+            return;
+        }
+        let on = Self::numa_balancing_sysctl_on() as u8;
+        let bss_data = self.skel.maps.bss_data.as_mut().unwrap();
+        if bss_data.numa_balancing_on != on {
+            info!("NUMA balancing: {}", if on != 0 { "on" } else { "off" });
+            bss_data.numa_balancing_on = on;
+        }
+    }
+
+    /// Mirror the node the kernel's NUMA balancing picks for a task into
+    /// the task context as it changes. sched_setnuma() is the one place
+    /// the kernel stores it. The probe is an fentry program, which needs
+    /// the function tracer; without it the node read at task init stands.
+    fn attach_numa_probe(skel: &mut OpenBpfSkel) -> Result<bool> {
+        if skel.maps.rodata_data.as_ref().unwrap().numa_balancing == 0 {
+            return Ok(false);
+        }
+        if !compat::tracer_available("function")? {
+            info!("Ftrace is not enabled; preferred NUMA nodes are read at task init only.");
+            return Ok(false);
+        }
+        compat::cond_kprobe_enable("sched_setnuma", &skel.progs.fentry_sched_setnuma)
+    }
+
     fn init_globals(
         skel: &mut OpenBpfSkel,
         opts: &Opts,
@@ -756,6 +804,20 @@ impl<'a> Scheduler<'a> {
         rodata.enable_cpu_bw = opts.enable_cpu_bw;
         // Replenishment wakes dispatch through the built-in idle tracking.
         rodata.bw_kick_builtin_idle = true;
+
+        // Follow the kernel's NUMA balancing only when it can do something:
+        // the kernel is built with it, there is more than one node,
+        // kernel.numa_balancing is on and the user did not opt out.
+        let numa_balancing = !opts.no_numa_balancing
+            && order.nr_numa > 1
+            && compat::struct_has_field("task_struct", "numa_preferred_nid").unwrap_or(false)
+            && Self::numa_balancing_sysctl_on();
+        rodata.numa_balancing = numa_balancing as u8;
+        bss_data.numa_balancing_on = numa_balancing as u8;
+        info!(
+            "NUMA balancing: {}",
+            if numa_balancing { "on" } else { "off" }
+        );
 
         // Fail hard if cpu.max was explicitly requested but the kernel lacks
         // ops.cgroup_set_bandwidth support; setup_cgroup_bw() otherwise disables
@@ -1095,6 +1157,7 @@ impl<'a> Scheduler<'a> {
                 }
             }
             self.cleanup_introspec();
+            self.refresh_numa_balancing();
         }
 
         bpf_streams::dump_bpf_streams(&mut self.skel);
