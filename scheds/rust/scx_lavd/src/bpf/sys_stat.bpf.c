@@ -66,6 +66,7 @@ struct sys_stat_ctx {
 	u32		nr_lat_cri;
 	u32		nr_x_migration;
 	u32		nr_numa_mig;
+	u32		nr_numa_declined;
 	u32		nr_big;
 	u32		nr_pc_on_big;
 	u32		nr_lc_on_big;
@@ -509,6 +510,9 @@ static void collect_sys_stat(void)
 		c->nr_numa_mig += cpuc->nr_numa_mig;
 		cpuc->nr_numa_mig = 0;
 
+		c->nr_numa_declined += cpuc->nr_numa_declined;
+		cpuc->nr_numa_declined = 0;
+
 		/*
 		 * Accumulate task's latency criticlity information.
 		 *
@@ -706,6 +710,7 @@ static void calc_sys_stat(void)
 		sys_stat.nr_lat_cri >>= 1;
 		sys_stat.nr_x_migration >>= 1;
 		sys_stat.nr_numa_mig >>= 1;
+		sys_stat.nr_numa_declined >>= 1;
 		sys_stat.nr_big >>= 1;
 		sys_stat.nr_pc_on_big >>= 1;
 		sys_stat.nr_lc_on_big >>= 1;
@@ -721,6 +726,7 @@ static void calc_sys_stat(void)
 	sys_stat.nr_lat_cri += c->nr_lat_cri;
 	sys_stat.nr_x_migration += c->nr_x_migration;
 	sys_stat.nr_numa_mig += c->nr_numa_mig;
+	sys_stat.nr_numa_declined += c->nr_numa_declined;
 	sys_stat.nr_big += c->nr_big;
 	sys_stat.nr_pc_on_big += c->nr_pc_on_big;
 	sys_stat.nr_lc_on_big += c->nr_lc_on_big;

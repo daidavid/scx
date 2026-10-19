@@ -448,6 +448,20 @@ static bool try_to_steal_task(struct cpdom_ctx *cpdomc)
 			if (!READ_ONCE(cpdomc_pick->is_stealee) || !cpdomc_pick->is_valid)
 				continue;
 
+			/*
+			 * NUMA balancing: never steal across nodes. A task's
+			 * memory stays on its node, and the steal would trade
+			 * remote accesses for the rest of the task's life
+			 * against a few idle cycles now. A node with no active
+			 * CPU, which is one whose CPUs have all gone offline, is
+			 * the exception: nothing else serves its queues and it
+			 * has no locality to protect.
+			 */
+			if (numa_balancing_active() &&
+			    cpdomc_pick->numa_id != cpdomc->numa_id &&
+			    READ_ONCE(numa_cap_active[cpdomc_pick->numa_id]))
+				continue;
+
 			if (READ_ONCE(cpdomc_pick->stealee_budget_invr) <= 0)
 				continue;
 
@@ -518,6 +532,7 @@ static bool force_to_steal_task(struct cpdom_ctx *cpdomc)
 {
 	struct cpdom_ctx *cpdomc_pick;
 	s64 nr_nbr, cpdom_id;
+	bool declined = false;
 
 	/*
 	 * Traverse neighbor compute domains in distance order.
@@ -547,6 +562,20 @@ static bool force_to_steal_task(struct cpdom_ctx *cpdomc)
 
 			if (!cpdomc_pick->is_valid)
 				continue;
+
+			/*
+			 * NUMA balancing: force stealing stays within the node
+			 * as well, with the same exception. Work left waiting on
+			 * another node while this CPU idles is the intended
+			 * trade, locality over idle cycles, counted as NUMA-DECL.
+			 */
+			if (numa_balancing_active() &&
+			    cpdomc_pick->numa_id != cpdomc->numa_id &&
+			    READ_ONCE(numa_cap_active[cpdomc_pick->numa_id])) {
+				if (READ_ONCE(cpdomc_pick->nr_queued_task))
+					declined = true;
+				continue;
+			}
 
 			dsq_id = pick_most_loaded_dsq(cpdomc_pick);
 			/*
@@ -579,6 +608,12 @@ static bool force_to_steal_task(struct cpdom_ctx *cpdomc)
 		}
 	}
 
+	if (declined) {
+		struct cpu_ctx *cpuc = get_cpu_ctx();
+
+		if (cpuc)
+			cpuc->nr_numa_declined++;
+	}
 	return false;
 }
 

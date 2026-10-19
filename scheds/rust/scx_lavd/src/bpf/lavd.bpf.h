@@ -521,6 +521,7 @@ struct cpu_ctx {
 	volatile u32	max_freq_observed; /* maximum CPU frequency observed within an interval scaled to 1024 */
 	volatile u32	max_freq;	/* maximum CPU frequency averaged across multiple intervals */
 	volatile u32	nr_numa_mig;	/* picks that moved a task to its preferred NUMA node */
+	volatile u32	nr_numa_declined; /* cross-node steals and donations declined for NUMA locality */
 	/*
 	 * Snapshot of scx_clock_task() taken at the end of the last
 	 * collect_sys_stat() interval. scx_clock_task() advances during tasks
