@@ -606,6 +606,7 @@ extern const volatile bool	no_slice_boost;
 extern const volatile u8	verbose;
 extern const volatile u8	numa_balancing; /* preferred NUMA nodes are recorded */
 extern volatile u8		numa_balancing_on; /* kernel.numa_balancing is on */
+extern volatile u32		numa_cap_active[LAVD_NUMA_ID_MAX]; /* capacity of the node's active CPUs */
 
 /* Whether preferred NUMA nodes are recorded and are to be acted on. */
 static inline bool numa_balancing_active(void)
@@ -999,6 +1000,7 @@ ovrflw_test_and_clear(struct bpf_cpumask *ovrflw, s32 cpu)
 /* Load balancer helpers. */
 
 int plan_x_cpdom_migration(void);
+void update_numa_summary(void);
 
 /* Preemption management helpers. */
 void shrink_slice_at_tick(struct task_struct *p, struct cpu_ctx *cpuc, u64 now);

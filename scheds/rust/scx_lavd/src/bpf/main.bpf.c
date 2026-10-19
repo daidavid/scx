@@ -2986,6 +2986,13 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(lavd_init)
 	err = init_per_cpu_ctx(now);
 	if (err)
 		return err;
+
+	/*
+	 * The NUMA placement paths read the per-node summary before the
+	 * first timer tick refreshes it.
+	 */
+	if (numa_balancing)
+		update_numa_summary();
 	warn_cpufreq_rate_limit_err();
 
 	/*

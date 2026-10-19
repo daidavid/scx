@@ -154,6 +154,54 @@ reset_role:
 	return 0;
 }
 
+/*
+ * Per-node summary for the NUMA placement paths, refreshed every interval:
+ * the capacity of the node's active CPUs. A parked or offlined domain is
+ * left out; the domain mask is kept up to date on hotplug even when core
+ * compaction is off and the active counts are not. Summed into a temporary
+ * first, so that a reader sees a node's old or new value and never a
+ * partial sum.
+ */
+volatile u32 numa_cap_active[LAVD_NUMA_ID_MAX];
+static u32 numa_cap_active_tmp[LAVD_NUMA_ID_MAX];
+static volatile u32 numa_summary_busy;
+
+__hidden
+void update_numa_summary(void)
+{
+	struct cpdom_ctx *cpdomc;
+	u64 cpdom_id;
+	int nid;
+
+	/* The timer and a hotplug update can get here at the same time. */
+	if (__sync_val_compare_and_swap(&numa_summary_busy, 0, 1))
+		return;
+
+	bpf_for(nid, 0, LAVD_NUMA_ID_MAX)
+		numa_cap_active_tmp[nid] = 0;
+
+	bpf_rcu_read_lock();
+	bpf_for(cpdom_id, 0, nr_cpdoms) {
+		struct bpf_cpumask *cpd_mask;
+
+		if (cpdom_id >= LAVD_CPDOM_MAX_NR)
+			break;
+		cpdomc = MEMBER_VPTR(cpdom_ctxs, [cpdom_id]);
+		cpd_mask = MEMBER_VPTR(cpdom_cpumask, [cpdom_id]);
+		if (!cpdomc || !cpd_mask || !cpdomc->is_valid ||
+		    !READ_ONCE(cpdomc->nr_active_cpus) ||
+		    bpf_cpumask_empty(cast_mask(cpd_mask)))
+			continue;
+		numa_cap_active_tmp[cpdomc->numa_id] += READ_ONCE(cpdomc->cap_sum_active_cpus);
+	}
+	bpf_rcu_read_unlock();
+
+	bpf_for(nid, 0, LAVD_NUMA_ID_MAX)
+		WRITE_ONCE(numa_cap_active[nid], numa_cap_active_tmp[nid]);
+
+	WRITE_ONCE(numa_summary_busy, 0);
+}
+
 __weak
 int plan_x_cpdom_migration(void)
 {
@@ -526,6 +574,20 @@ static bool try_to_steal_task(struct cpdom_ctx *cpdomc)
 			if (!READ_ONCE(cpdomc_pick->is_stealee) || !cpdomc_pick->is_valid)
 				continue;
 
+			/*
+			 * NUMA balancing: never steal across nodes. A task's
+			 * memory stays on its node, and the steal would trade
+			 * remote accesses for the rest of the task's life
+			 * against a few idle cycles now. A node with no active
+			 * CPU, parked by core compaction or offlined, is the
+			 * exception: nothing else serves its queues and it has
+			 * no locality to protect.
+			 */
+			if (numa_balancing_active() &&
+			    cpdomc_pick->numa_id != cpdomc->numa_id &&
+			    READ_ONCE(numa_cap_active[cpdomc_pick->numa_id]))
+				continue;
+
 			if (READ_ONCE(cpdomc_pick->stealee_budget_invr) <= 0)
 				continue;
 
@@ -649,10 +711,20 @@ static bool force_to_steal_task(struct cpdom_ctx *cpdomc)
 			if (!cpdomc_pick->is_valid)
 				continue;
 
-			/* Never steal across NUMA nodes. */
-			if (!no_force_steal_limit &&
-			    cpdomc_pick->numa_id != cpdomc->numa_id)
-				continue;
+			/*
+			 * Never steal across NUMA nodes. While NUMA balancing is
+			 * followed the rule holds even with --no-force-steal-limit,
+			 * except for a node with no active CPU: nothing else
+			 * serves its queues, and it has no locality to protect.
+			 */
+			if (cpdomc_pick->numa_id != cpdomc->numa_id) {
+				if (numa_balancing_active()) {
+					if (READ_ONCE(numa_cap_active[cpdomc_pick->numa_id]))
+						continue;
+				} else if (!no_force_steal_limit) {
+					continue;
+				}
+			}
 
 			dsq_id = pick_most_loaded_dsq(cpdomc_pick);
 			/*

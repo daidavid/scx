@@ -663,6 +663,24 @@ bool is_sync_wakeup(struct pick_ctx *ctx)
 	return true;
 }
 
+/*
+ * NUMA balancing: a task with a node never follows a sync waker to a node
+ * that is neither its previous CPU's nor its own, so such a waker is not a
+ * candidate at all and no branch below sees it.
+ */
+static __always_inline
+bool numa_waker_declined(struct pick_ctx *ctx, s32 waker_cpu)
+{
+	s32 nid = ctx->taskc->numa_nid, waker_nid;
+
+	if (!numa_balancing_active() || nid < 0)
+		return false;
+	waker_nid = cpu_to_numa_id(waker_cpu);
+	if (waker_nid == nid)
+		return false;
+	return waker_nid != cpu_to_numa_id(ctx->prev_cpu);
+}
+
 static
 s32 find_sticky_cpu_and_cpdom(struct pick_ctx *ctx, s64 *sticky_cpdom)
 {
@@ -678,7 +696,8 @@ s32 find_sticky_cpu_and_cpdom(struct pick_ctx *ctx, s64 *sticky_cpdom)
 	test_cpu_stickable(ctx, &sctx, ctx->prev_cpu, ctx->is_task_big);
 	if (is_sync_wakeup(ctx)) {
 		s32 waker_cpu = bpf_get_smp_processor_id();
-		if (waker_cpu != ctx->prev_cpu) {
+		if (waker_cpu != ctx->prev_cpu &&
+		    !numa_waker_declined(ctx, waker_cpu)) {
 			ctx->sync_waker_cpu = waker_cpu;
 			test_cpu_stickable(ctx, &sctx, ctx->sync_waker_cpu, ctx->is_task_big);
 		}
@@ -901,6 +920,14 @@ s32 migrate_to_neighbor(struct pick_ctx *ctx, struct cpdom_ctx *cpdc,
 				   !READ_ONCE(mig_cpdc->is_stealer)) {
 				continue;
 			}
+
+			/*
+			 * NUMA balancing: donation is stealing at wakeup and
+			 * stays within the node as well.
+			 */
+			if (numa_balancing_active() &&
+			    mig_cpdc->numa_id != cpdc->numa_id)
+				continue;
 
 			cpu = pick_idle_cpu_at_cpdom(ctx, mig_cpdom, scope);
 			if (cpu >= 0) {
