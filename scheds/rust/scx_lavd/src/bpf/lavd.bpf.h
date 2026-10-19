@@ -162,6 +162,7 @@ enum consts_flags {
 	LAVD_FLAG_DOMAIN_PINNED		= (0x1 << 15), /* task's cpumask is confined to a single compute domain */
 	LAVD_FLAG_IS_EFFECTIVELY_PINNED	= (0x1 << 16), /* effective cpumask weight is 1 (permanent or migrate-disable) */
 	LAVD_FLAG_WARM_CPU		= (0x1 << 17), /* wait on the previous CPU: enqueue on its per-CPU DSQ */
+	LAVD_FLAG_NUMA_EXEC		= (0x1 << 18), /* NUMA node chosen at exec; settled at the next pick */
 };
 
 #define LAVD_MASK_MIGRATION		(LAVD_FLAG_MIGRATION_AGGRESSIVE)
@@ -585,6 +586,9 @@ extern const volatile bool	no_slice_boost;
 extern const volatile u8	verbose;
 extern const volatile u8	numa_balancing; /* preferred NUMA nodes are recorded */
 extern volatile u8		numa_balancing_on; /* kernel.numa_balancing is on */
+extern const volatile u32	nr_numa_nodes; /* number of NUMA nodes that have CPUs */
+extern volatile u64		numa_load_invr[LAVD_NUMA_ID_MAX]; /* load of the node's active compute domains */
+extern volatile u32		numa_cap_active[LAVD_NUMA_ID_MAX]; /* capacity of the node's active CPUs */
 
 /* Whether preferred NUMA nodes are recorded and are to be acted on. */
 static inline bool numa_balancing_active(void)
@@ -900,6 +904,7 @@ ovrflw_test_and_clear(struct bpf_cpumask *ovrflw, s32 cpu)
 /* Load balancer helpers. */
 
 int plan_x_cpdom_migration(void);
+void update_numa_summary(void);
 
 /* Preemption management helpers. */
 void shrink_slice_at_tick(struct task_struct *p, struct cpu_ctx *cpuc, u64 now);

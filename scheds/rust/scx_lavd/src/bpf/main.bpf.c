@@ -248,6 +248,12 @@ const volatile u8	numa_balancing = 0;
 volatile u8		numa_balancing_on = 0;
 
 /*
+ * Number of NUMA nodes that have CPUs. When NUMA balancing is followed, the
+ * active set keeps at least one CPU per node.
+ */
+const volatile u32	nr_numa_nodes = 1;
+
+/*
  * Skip periodic load balancing when average system utilization is below this
  * threshold. The value is pre-scaled by userspace. 0 = disabled.
  * Default: p2s(25) = 256.
@@ -925,7 +931,7 @@ void BPF_STRUCT_OPS(lavd_enqueue, struct task_struct *p, u64 enq_flags)
 {
 	struct cpu_ctx *cpuc, *cpuc_cur;
 	s32 task_cpu, cpu = -ENOENT;
-	bool is_idle = false;
+	bool is_idle = false, numa_exec;
 	task_ctx *taskc;
 	u64 dsq_id;
 
@@ -936,6 +942,8 @@ void BPF_STRUCT_OPS(lavd_enqueue, struct task_struct *p, u64 enq_flags)
 		return;
 	}
 	task_cpu = scx_bpf_task_cpu(p);
+	/* The pick below consumes the flag, see numa_place_on_exec(). */
+	numa_exec = test_task_flag(taskc, LAVD_FLAG_NUMA_EXEC);
 
 	/*
 	 * A reenqueue (SCX_ENQ_REENQ) means the task was already placed once
@@ -1132,6 +1140,16 @@ void BPF_STRUCT_OPS(lavd_enqueue, struct task_struct *p, u64 enq_flags)
 
 kick_cpu_out:
 	/*
+	 * NUMA balancing: the CPU an exec-placed task leaves as the last task
+	 * is about to idle. It may still hold work on its own DSQ that the
+	 * dispatch skipped, or the task itself when its node had no idle
+	 * CPU, and nothing else would wake it. Kick it so that it runs one
+	 * more dispatch once idle.
+	 */
+	if (numa_exec && (enq_flags & SCX_ENQ_LAST))
+		scx_bpf_kick_cpu(cpuc_cur->cpu_id, SCX_KICK_IDLE);
+
+	/*
 	 * Kick @cpu so an idle CPU picks up the task.
 	 */
 	if (is_idle) {
@@ -1291,6 +1309,15 @@ void consume_prev(struct task_struct *prev, task_ctx *taskc_prev, struct cpu_ctx
 
 	taskc_prev = taskc_prev ?: get_task_ctx(prev);
 	if (!taskc_prev)
+		return;
+
+	/*
+	 * NUMA balancing: a task placed on another node at exec is not kept
+	 * here. With its slice left at zero the kernel enqueues it again as
+	 * the last task, since SCX_OPS_ENQ_LAST is set, and the pick moves
+	 * it, see numa_place_on_exec().
+	 */
+	if (test_task_flag(taskc_prev, LAVD_FLAG_NUMA_EXEC))
 		return;
 
 	/*
@@ -1734,6 +1761,15 @@ void BPF_STRUCT_OPS(lavd_running, struct task_struct *p)
 
 	unaccount_queued_load(taskc);
 	unaccount_queued_load_pcpu(taskc);
+
+	/*
+	 * NUMA balancing: a task placed at exec that runs again without a
+	 * pick settles on the node it runs on, see pick_idle_cpu().
+	 */
+	if (unlikely(test_task_flag(taskc, LAVD_FLAG_NUMA_EXEC))) {
+		reset_task_flag(taskc, LAVD_FLAG_NUMA_EXEC);
+		taskc->numa_nid = cpu_to_numa_id(cpuc->cpu_id);
+	}
 
 	/*
 	 * If the sched_ext core directly dispatched a task, calculating the
@@ -2929,6 +2965,88 @@ int set_aggressive_migration(void)
 		set_task_flag(taskc, LAVD_FLAG_MIGRATION_AGGRESSIVE);
 		scx_bpf_kick_cpu(cpu, SCX_KICK_PREEMPT);
 	}
+	return 0;
+}
+
+/* rotates the node the search below starts from across execs */
+static volatile u32 numa_exec_rr;
+
+/*
+ * A task that has just execed has a new address space, and its memory will
+ * be first touched on whichever node it runs on next. Choose the node with
+ * the least load per unit of active capacity; among nodes within a
+ * sixteenth of each other the search order decides, and it rotates across
+ * execs so that an idle machine spreads new processes instead of stacking
+ * them on one node. Record the node and kick the CPU: consume_prev() then
+ * leaves the task's slice at zero, the kernel enqueues it again as the last
+ * task, and the pick moves it before it returns to user space, or leaves it
+ * on its CPU, which lavd_enqueue() kicks. The node the task lands on
+ * becomes its node either way, see pick_idle_cpu().
+ */
+static void numa_place_on_exec(struct task_struct *p)
+{
+	u64 best = (u64)-1, load;
+	s32 best_nid = NUMA_NO_NODE;
+	struct cpu_ctx *cpuc;
+	task_ctx *taskc;
+	u32 nr = 0, start, rank = 0, seen = 0, nid, cap, i;
+
+	if (!numa_balancing_active())
+		return;
+	cpuc = get_cpu_ctx();
+	taskc = find_task_ctx(p);
+	if (!cpuc || !taskc)
+		return;
+	if (test_task_flag(taskc, LAVD_FLAG_IS_AFFINITIZED))
+		return;
+
+	bpf_for(i, 0, LAVD_NUMA_ID_MAX) {
+		if (READ_ONCE(numa_cap_active[i]))
+			nr++;
+	}
+	if (!nr)
+		return;
+	start = __sync_fetch_and_add(&numa_exec_rr, 1) % nr;
+
+	/*
+	 * Two passes over the node ids: the first skips the nodes ranked
+	 * before the rotated start, the second picks them up.
+	 */
+	bpf_for(i, 0, 2 * LAVD_NUMA_ID_MAX) {
+		if (seen >= nr)
+			break;
+		nid = i & (LAVD_NUMA_ID_MAX - 1);
+		cap = READ_ONCE(numa_cap_active[nid]);
+		if (!cap)
+			continue;
+		if (rank < start) {
+			rank++;
+			continue;
+		}
+		seen++;
+		load = (READ_ONCE(numa_load_invr[nid]) << LAVD_SHIFT) / cap;
+		if (load + (load >> 4) < best) {
+			best = load;
+			best_nid = nid;
+		}
+	}
+	if (best_nid < 0)
+		return;
+
+	taskc->numa_nid = best_nid;
+	taskc->numa_retry_clk = 0;
+	if (best_nid == cpu_to_numa_id(cpuc->cpu_id))
+		return;
+	set_task_flag(taskc, LAVD_FLAG_NUMA_EXEC);
+	scx_bpf_kick_cpu(cpuc->cpu_id, SCX_KICK_PREEMPT);
+}
+
+/* Fires only for an exec that succeeded, in the context of the task. */
+SEC("?tp_btf/sched_process_exec")
+int BPF_PROG(lavd_numa_exec, struct task_struct *p, pid_t old_pid,
+	     struct linux_binprm *bprm)
+{
+	numa_place_on_exec(p);
 	return 0;
 }
 

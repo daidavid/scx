@@ -22,6 +22,7 @@ use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::collections::HashSet;
+use std::collections::VecDeque;
 use std::fmt;
 use std::hash::{Hash, Hasher};
 use tracing::debug;
@@ -105,8 +106,9 @@ impl CpuOrder {
     pub fn new(
         topology_args: Option<&scx_utils::TopologyArgs>,
         no_use_em: bool,
+        interleave_numa: bool,
     ) -> Result<CpuOrder> {
-        let ctx = CpuOrderCtx::new(topology_args, no_use_em)?;
+        let ctx = CpuOrderCtx::new(topology_args, no_use_em, interleave_numa)?;
         let cpus_pf = ctx.build_topo_order(false).unwrap();
         let cpus_ps = ctx.build_topo_order(true).unwrap();
         let cpdom_map = CpuOrderCtx::build_cpdom(&cpus_pf).unwrap();
@@ -127,7 +129,7 @@ impl CpuOrder {
             nr_cores: ctx.topo.all_cores.len(),
             nr_cpdoms,
             nr_llcs: ctx.topo.all_llcs.len(),
-            nr_numa: ctx.topo.nodes.len(),
+            nr_numa: ctx.nr_numa_with_cpus(),
             smt_enabled: ctx.smt_enabled,
             has_biglittle: ctx.has_biglittle,
             has_energy_model: ctx.has_energy_model,
@@ -142,10 +144,15 @@ struct CpuOrderCtx {
     smt_enabled: bool,
     has_biglittle: bool,
     has_energy_model: bool,
+    interleave_numa: bool,
 }
 
 impl CpuOrderCtx {
-    fn new(topology_args: Option<&scx_utils::TopologyArgs>, no_use_em: bool) -> Result<Self> {
+    fn new(
+        topology_args: Option<&scx_utils::TopologyArgs>,
+        no_use_em: bool,
+        interleave_numa: bool,
+    ) -> Result<Self> {
         let topo = match topology_args {
             Some(args) => Topology::with_args(args)?,
             None => Topology::new()?,
@@ -169,7 +176,17 @@ impl CpuOrderCtx {
             smt_enabled,
             has_biglittle,
             has_energy_model,
+            interleave_numa,
         })
+    }
+
+    /// NUMA nodes that have CPUs; a memory-only node is not a place to run.
+    fn nr_numa_with_cpus(&self) -> usize {
+        self.topo
+            .nodes
+            .values()
+            .filter(|node| !node.all_cpus.is_empty())
+            .count()
     }
 
     /// Build a CPU preference order based on its optimization target
@@ -285,7 +302,38 @@ impl CpuOrderCtx {
             }
         }
 
+        // Core compaction activates CPUs in this order. When NUMA balancing
+        // is followed, every node has to keep an active CPU for the tasks
+        // placed on it at exec, so interleave the nodes.
+        if self.interleave_numa && self.nr_numa_with_cpus() > 1 {
+            cpu_ids = Self::interleave_nodes(cpu_ids);
+        }
+
         Some(cpu_ids)
+    }
+
+    /// Interleave the order across NUMA nodes, keeping each node's own
+    /// order, so that any prefix of the order spans every node.
+    fn interleave_nodes(cpu_ids: Vec<CpuId>) -> Vec<CpuId> {
+        let mut per_node: BTreeMap<usize, VecDeque<CpuId>> = BTreeMap::new();
+        for cpu in cpu_ids {
+            per_node.entry(cpu.numa_adx).or_default().push_back(cpu);
+        }
+
+        let mut out = Vec::new();
+        loop {
+            let mut any = false;
+            for queue in per_node.values_mut() {
+                if let Some(cpu) = queue.pop_front() {
+                    out.push(cpu);
+                    any = true;
+                }
+            }
+            if !any {
+                break;
+            }
+        }
+        out
     }
 
     /// Build a list of compute domains

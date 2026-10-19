@@ -734,7 +734,7 @@ static s32 pick_numa_preferred_cpu(struct pick_ctx *ctx, bool *is_idle)
 	struct cpdom_ctx *cpdomc;
 	struct cpu_ctx *cpuc_cur;
 	s32 nid = taskc->numa_nid, cpu = -ENOENT;
-	u64 now;
+	u64 now, pick_flags;
 	int cpdom_id;
 
 	if (!numa_balancing_active() || nid < 0 || nid >= LAVD_NUMA_ID_MAX)
@@ -757,11 +757,13 @@ static s32 pick_numa_preferred_cpu(struct pick_ctx *ctx, bool *is_idle)
 		return -ENOENT;
 
 	/*
-	 * A fully idle core on the preferred node, searched one compute
-	 * domain at a time and in the active set only. The overflow set
-	 * serves pinned work, and a node that core compaction has parked is
-	 * not a place to move a task to.
+	 * A fully idle core on the preferred node, or any idle CPU for a task
+	 * placed at exec, which has no cache footprint to keep, searched one
+	 * compute domain at a time and in the active set only. The overflow
+	 * set serves pinned work, and a node that core compaction has parked
+	 * is not a place to move a task to.
 	 */
+	pick_flags = test_task_flag(taskc, LAVD_FLAG_NUMA_EXEC) ? 0 : SCX_PICK_IDLE_CORE;
 	bpf_for(cpdom_id, 0, nr_cpdoms) {
 		if (cpdom_id >= LAVD_CPDOM_MAX_NR)
 			break;
@@ -772,7 +774,7 @@ static s32 pick_numa_preferred_cpu(struct pick_ctx *ctx, bool *is_idle)
 			continue;
 
 		bpf_cpumask_and(temp, cast_mask(cpd_mask), cast_mask(ctx->active));
-		cpu = scx_bpf_pick_idle_cpu(cast_mask(temp), SCX_PICK_IDLE_CORE);
+		cpu = scx_bpf_pick_idle_cpu(cast_mask(temp), pick_flags);
 		if (cpu >= 0)
 			break;
 	}
@@ -1136,6 +1138,15 @@ unlock_out:
 	 */
 	if (cpu < 0)
 		cpu = pick_random_cpu(ctx);
+
+	/*
+	 * NUMA balancing: a task placed at exec settles on the node of the
+	 * CPU it lands on, whether or not that is the node chosen for it.
+	 */
+	if (test_task_flag(ctx->taskc, LAVD_FLAG_NUMA_EXEC)) {
+		reset_task_flag(ctx->taskc, LAVD_FLAG_NUMA_EXEC);
+		ctx->taskc->numa_nid = cpu_to_numa_id(cpu);
+	}
 
 	/*
 	 * Clean up.

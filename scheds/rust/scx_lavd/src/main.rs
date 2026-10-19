@@ -534,7 +534,8 @@ impl<'a> Scheduler<'a> {
         }
 
         // Initialize CPU topology with CLI arguments
-        let order = CpuOrder::new(opts.topology.as_ref(), opts.no_use_em).unwrap();
+        let numa_wanted = Self::numa_balancing_wanted(opts);
+        let order = CpuOrder::new(opts.topology.as_ref(), opts.no_use_em, numa_wanted).unwrap();
         Self::init_cpus(&mut skel, &order);
         Self::init_cpdoms(&mut skel, &order);
 
@@ -547,6 +548,7 @@ impl<'a> Scheduler<'a> {
         // Initialize skel according to @opts.
         Self::init_globals(&mut skel, opts, &order, debug_level)?;
         Self::attach_numa_probe(&mut skel)?;
+        Self::attach_numa_exec_tracepoint(&mut skel)?;
 
         // Mirror the cpu.max caps into rodata so the BPF admission gates match
         // the map sizes set just below.
@@ -729,6 +731,15 @@ impl<'a> Scheduler<'a> {
         }
     }
 
+    /// Whether to follow the kernel's NUMA balancing, short of the node
+    /// count: the user did not opt out, the kernel is built with it and
+    /// kernel.numa_balancing is on.
+    fn numa_balancing_wanted(opts: &Opts) -> bool {
+        !opts.no_numa_balancing
+            && compat::struct_has_field("task_struct", "numa_preferred_nid").unwrap_or(false)
+            && Self::numa_balancing_sysctl_on()
+    }
+
     /// Whether kernel.numa_balancing has NUMA_BALANCING_NORMAL set, which is
     /// what drives the hinting-fault scan the preferred node comes from.
     fn numa_balancing_sysctl_on() -> bool {
@@ -766,6 +777,15 @@ impl<'a> Scheduler<'a> {
             return Ok(false);
         }
         compat::cond_kprobe_enable("sched_setnuma", &skel.progs.fentry_sched_setnuma)
+    }
+
+    /// Choose a NUMA node for a task when it execs, see numa_place_on_exec().
+    /// The tracepoint fires only for an exec that succeeded.
+    fn attach_numa_exec_tracepoint(skel: &mut OpenBpfSkel) -> Result<bool> {
+        if skel.maps.rodata_data.as_ref().unwrap().numa_balancing == 0 {
+            return Ok(false);
+        }
+        compat::cond_tracepoint_enable("sched:sched_process_exec", &skel.progs.lavd_numa_exec)
     }
 
     fn init_globals(
@@ -808,11 +828,9 @@ impl<'a> Scheduler<'a> {
         // Follow the kernel's NUMA balancing only when it can do something:
         // the kernel is built with it, there is more than one node,
         // kernel.numa_balancing is on and the user did not opt out.
-        let numa_balancing = !opts.no_numa_balancing
-            && order.nr_numa > 1
-            && compat::struct_has_field("task_struct", "numa_preferred_nid").unwrap_or(false)
-            && Self::numa_balancing_sysctl_on();
+        let numa_balancing = Self::numa_balancing_wanted(opts) && order.nr_numa > 1;
         rodata.numa_balancing = numa_balancing as u8;
+        rodata.nr_numa_nodes = order.nr_numa as u32;
         bss_data.numa_balancing_on = numa_balancing as u8;
         info!(
             "NUMA balancing: {}",

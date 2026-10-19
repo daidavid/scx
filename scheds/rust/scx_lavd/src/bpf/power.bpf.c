@@ -332,6 +332,9 @@ int do_core_compaction(void)
 	const volatile u16 *cpu_order;
 	struct cpdom_ctx *cpdomc;
 	int nr_active, cpu, i;
+	u64 node_seen[LAVD_NUMA_ID_MAX / 64] = {};
+	u32 nr_node_seen = 0, nid;
+	bool numa_floor;
 	u64 cpdom_id;
 
 	bpf_rcu_read_lock();
@@ -376,9 +379,28 @@ int do_core_compaction(void)
 		}
 
 		/*
+		 * NUMA balancing: every node that has an online CPU keeps at
+		 * least one active CPU, so that a task placed on the node at
+		 * exec has a CPU to land on there. The order is interleaved
+		 * across nodes at start for the same reason, so this is the
+		 * first online CPU of a node the active prefix did not reach.
+		 */
+		cpdomc = MEMBER_VPTR(cpdom_ctxs, [cpuc->cpdom_id]);
+		numa_floor = false;
+		if (numa_balancing && cpdomc && nr_node_seen < nr_numa_nodes) {
+			nid = cpdomc->numa_id;
+			if (!(node_seen[nid / 64] & (1ULL << (nid % 64)))) {
+				node_seen[nid / 64] |= 1ULL << (nid % 64);
+				nr_node_seen++;
+				if (i >= nr_active)
+					numa_floor = true;
+			}
+		}
+
+		/*
 		 * Assign an online cpu to active and overflow cpumasks
 		 */
-		if (i < nr_active) {
+		if (i < nr_active || numa_floor) {
 			bpf_cpumask_set_cpu(cpu, active);
 			ovrflw_test_and_clear(ovrflw, cpu);
 
@@ -386,7 +408,6 @@ int do_core_compaction(void)
 			 * Accumulate the capacity of active CPUs and
 			 * increase the number of active CPUs.
 			 */
-			cpdomc = MEMBER_VPTR(cpdom_ctxs, [cpuc->cpdom_id]);
 			if (cpdomc) {
 				cpdomc->cap_sum_temp += cpuc->effective_capacity;
 				cpdomc->nr_acpus_temp++;

@@ -139,6 +139,66 @@ reset_role:
 	return 0;
 }
 
+/*
+ * Per-node summaries for the NUMA placement paths, refreshed every
+ * interval: the load of the node's active compute domains and the
+ * capacity of their active CPUs. A parked or offlined domain is left
+ * out: its load is stale and its capacity is gone. Summed into the
+ * temporaries first, so that a reader sees a node's old or new value and
+ * never a partial sum.
+ */
+volatile u64 numa_load_invr[LAVD_NUMA_ID_MAX];
+volatile u32 numa_cap_active[LAVD_NUMA_ID_MAX];
+static u64 numa_load_invr_tmp[LAVD_NUMA_ID_MAX];
+static u32 numa_cap_active_tmp[LAVD_NUMA_ID_MAX];
+static volatile u32 numa_summary_busy;
+
+__hidden
+void update_numa_summary(void)
+{
+	struct cpdom_ctx *cpdomc;
+	u64 cpdom_id;
+	int nid;
+
+	/* The timer and a hotplug update can get here at the same time. */
+	if (__sync_val_compare_and_swap(&numa_summary_busy, 0, 1))
+		return;
+
+	bpf_for(nid, 0, LAVD_NUMA_ID_MAX) {
+		numa_load_invr_tmp[nid] = 0;
+		numa_cap_active_tmp[nid] = 0;
+	}
+
+	bpf_rcu_read_lock();
+	bpf_for(cpdom_id, 0, nr_cpdoms) {
+		struct bpf_cpumask *cpd_mask;
+
+		if (cpdom_id >= LAVD_CPDOM_MAX_NR)
+			break;
+		cpdomc = MEMBER_VPTR(cpdom_ctxs, [cpdom_id]);
+		cpd_mask = MEMBER_VPTR(cpdom_cpumask, [cpdom_id]);
+		if (!cpdomc || !cpd_mask || !cpdomc->is_valid ||
+		    !READ_ONCE(cpdomc->nr_active_cpus))
+			continue;
+		/*
+		 * The active counts are not refreshed on hotplug when core
+		 * compaction is off; the domain mask is.
+		 */
+		if (bpf_cpumask_empty(cast_mask(cpd_mask)))
+			continue;
+		numa_load_invr_tmp[cpdomc->numa_id] += READ_ONCE(cpdomc->load_invr);
+		numa_cap_active_tmp[cpdomc->numa_id] += READ_ONCE(cpdomc->cap_sum_active_cpus);
+	}
+	bpf_rcu_read_unlock();
+
+	bpf_for(nid, 0, LAVD_NUMA_ID_MAX) {
+		WRITE_ONCE(numa_load_invr[nid], numa_load_invr_tmp[nid]);
+		WRITE_ONCE(numa_cap_active[nid], numa_cap_active_tmp[nid]);
+	}
+
+	WRITE_ONCE(numa_summary_busy, 0);
+}
+
 __weak
 int plan_x_cpdom_migration(void)
 {
