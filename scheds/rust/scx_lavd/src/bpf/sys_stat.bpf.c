@@ -847,6 +847,12 @@ int update_sys_stat(void)
 	if (nr_cpdoms > 1)
 		plan_x_cpdom_migration();
 
+	/*
+	 * Refresh the per-node summary the NUMA placement paths read.
+	 */
+	if (numa_balancing)
+		update_numa_summary();
+
 	return 0;
 }
 

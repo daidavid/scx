@@ -663,6 +663,24 @@ bool is_sync_wakeup(struct pick_ctx *ctx)
 	return true;
 }
 
+/*
+ * NUMA balancing: a task with a node never follows a sync waker to a node
+ * that is neither its previous CPU's nor its own, so such a waker is not a
+ * candidate at all and no branch below sees it.
+ */
+static __always_inline
+bool numa_waker_declined(struct pick_ctx *ctx, s32 waker_cpu)
+{
+	s32 nid = ctx->taskc->numa_nid, waker_nid;
+
+	if (!numa_balancing_active() || nid < 0)
+		return false;
+	waker_nid = cpu_to_numa_id(waker_cpu);
+	if (waker_nid == nid)
+		return false;
+	return waker_nid != cpu_to_numa_id(ctx->prev_cpu);
+}
+
 static
 s32 find_sticky_cpu_and_cpdom(struct pick_ctx *ctx, s64 *sticky_cpdom)
 {
@@ -678,7 +696,8 @@ s32 find_sticky_cpu_and_cpdom(struct pick_ctx *ctx, s64 *sticky_cpdom)
 	test_cpu_stickable(ctx, &sctx, ctx->prev_cpu, ctx->is_task_big);
 	if (is_sync_wakeup(ctx)) {
 		s32 waker_cpu = bpf_get_smp_processor_id();
-		if (waker_cpu != ctx->prev_cpu) {
+		if (waker_cpu != ctx->prev_cpu &&
+		    !numa_waker_declined(ctx, waker_cpu)) {
 			ctx->sync_waker_cpu = waker_cpu;
 			test_cpu_stickable(ctx, &sctx, ctx->sync_waker_cpu, ctx->is_task_big);
 		}
@@ -899,6 +918,17 @@ s32 migrate_to_neighbor(struct pick_ctx *ctx, struct cpdom_ctx *cpdc,
 			if (unlikely(!mig_cpdc))
 				continue;
 
+			/*
+			 * NUMA balancing: neither the donation, which is
+			 * stealing at wakeup, nor the fallback walk leaves the
+			 * node. A neighbor on another node does not count as
+			 * having an idle CPU either, so that the caller skips
+			 * a second walk it could not use.
+			 */
+			if (numa_balancing_active() &&
+			    mig_cpdc->numa_id != cpdc->numa_id)
+				continue;
+
 			if (!cpdom_has_idle_cpu(mig_cpdom))
 				continue;
 			nbr_has_idle = true;
@@ -1069,7 +1099,11 @@ s32 pick_idle_cpu(struct pick_ctx *ctx, bool extend_ovrflw, bool *is_idle)
 	 * While the kernel's NUMA balancing is followed, a task that is not
 	 * affinitized and whose previous CPU is not on its preferred node
 	 * first tries a fully idle core on that node, ahead of all the
-	 * factors above (see pick_numa_preferred_cpu()).
+	 * factors above (see pick_numa_preferred_cpu()). Factors 6) and 7)
+	 * then keep to the node: a task with a preferred node does not
+	 * follow a sync waker to a node that is neither its previous CPU's
+	 * nor the preferred one, and a neighbor domain on another node is
+	 * skipped.
 	 *
 	 * Idle states come from per-domain idle masks, which are hints. A CPU
 	 * is used as idle only after it is claimed by atomically clearing its
@@ -1318,7 +1352,7 @@ s32 pick_idle_cpu(struct pick_ctx *ctx, bool extend_ovrflw, bool *is_idle)
 	 * sticky domain. On a heterogeneous system, the completion-time
 	 * estimate picks the neighbor instead, as for the donation above.
 	 * Skip the walk when the donation already found no idle CPU in any
-	 * neighbor.
+	 * neighbor it may use.
 	 */
 	if ((nr_cpdoms > 1) && !nbr_busy &&
 	    (cpdc = MEMBER_VPTR(cpdom_ctxs, [sticky_cpdom]))) {
@@ -1340,7 +1374,8 @@ s32 pick_idle_cpu(struct pick_ctx *ctx, bool extend_ovrflw, bool *is_idle)
 	 *  2) There is no idle CPU, not even a partially idle one, in the
 	 *     active/overflow set of the sticky domain.
 	 *  3) There is no idle CPU, not even a partially idle one, in the
-	 *     active/overflow set of any neighbor.
+	 *     active/overflow set of any neighbor, or of any neighbor on
+	 *     the sticky domain's node while NUMA balancing is followed.
 	 *  4) However, CPUs outside the active/overflow set, in the sticky
 	 *     domain or a neighbor, may still be idle. We don't even know
 	 *     whether there is any idle CPU in the system.

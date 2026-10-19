@@ -221,7 +221,9 @@ struct Opts {
     /// built with NUMA balancing, on a machine with more than one node and
     /// with kernel.numa_balancing on when the scheduler starts, the
     /// scheduler records the node the kernel prefers for each task and
-    /// places the task by it while the sysctl stays on.
+    /// places the task by it while the sysctl stays on. Load is then
+    /// balanced within each node only, except away from a node with no
+    /// active CPU.
     #[clap(long = "no-numa-balancing", action = clap::ArgAction::SetTrue)]
     no_numa_balancing: bool,
 
@@ -237,7 +239,9 @@ struct Opts {
 
     /// Default: --no-force-steal-limit is deactivated (force stealing is limited).
     /// Let force stealing scan every distance and NUMA node on each dispatch,
-    /// with no rate limit.
+    /// with no rate limit. While the kernel's NUMA balancing is followed
+    /// (see --no-numa-balancing), it steals from another node only when
+    /// that node has no active CPU.
     #[clap(long = "no-force-steal-limit", action = clap::ArgAction::SetTrue)]
     no_force_steal_limit: bool,
 
