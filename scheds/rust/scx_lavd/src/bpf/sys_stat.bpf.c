@@ -847,6 +847,9 @@ int update_sys_stat(void)
 	if (nr_cpdoms > 1)
 		plan_x_cpdom_migration();
 
+	if (numa_on)
+		update_numa_summary();
+
 	return 0;
 }
 
