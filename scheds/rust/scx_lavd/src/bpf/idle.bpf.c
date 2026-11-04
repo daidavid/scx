@@ -936,6 +936,37 @@ found:
 	return cpu;
 }
 
+/*
+ * A fully idle core on the task's home node, for a task away from it.
+ * Nothing is preempted or swapped: a task that finds none stays where the
+ * ordinary pick puts it and is considered again at its next pick.
+ */
+static s32 pick_idle_cpu_at_home(struct pick_ctx *ctx)
+{
+	struct cpdom_ctx *cpdomc;
+	s32 nid = ctx->taskc->numa_nid, cpu;
+	u64 id;
+
+	if (!numa_on || nid < 0 || cpu_to_numa_id(ctx->prev_cpu) == nid)
+		return -ENOENT;
+	/* No active CPU in the task's affinity: nothing to search. */
+	if (!ctx->a_mask)
+		return -ENOENT;
+
+	bpf_for(id, 0, nr_cpdoms) {
+		if (id >= LAVD_CPDOM_MAX_NR)
+			break;
+		cpdomc = MEMBER_VPTR(cpdom_ctxs, [id]);
+		if (!cpdomc || !cpdomc->is_valid || cpdomc->numa_id != nid ||
+		    !cpdomc->nr_active_cpus || !cpdom_has_idle_cpu(id))
+			continue;
+		cpu = pick_idle_cpu_in(id, cast_mask(ctx->a_mask), SCX_PICK_IDLE_CORE);
+		if (cpu >= 0)
+			return cpu;
+	}
+	return -ENOENT;
+}
+
 __hidden __noinline
 s32 pick_idle_cpu(struct pick_ctx *ctx, bool extend_ovrflw, bool *is_idle)
 {
@@ -1097,6 +1128,11 @@ s32 pick_idle_cpu(struct pick_ctx *ctx, bool extend_ovrflw, bool *is_idle)
 		if (!repartition_masks_for_latency(ctx))
 			goto err_out;
 	}
+
+	/* Toward the home node, before the sticky domain anchors @p nearby. */
+	cpu = pick_idle_cpu_at_home(ctx);
+	if (cpu >= 0)
+		goto idle_out;
 
 	/*
 	 * Find a sticky cpu and domain considering the core & task type
