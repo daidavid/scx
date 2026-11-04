@@ -236,6 +236,9 @@ const volatile u8	no_ovrflw_extend;
  */
 const volatile u64	warm_cpu_ns = 0;
 
+/* Keep tasks on their NUMA home node; set when the machine has more than one node. */
+const volatile u8	numa_on = 0;
+
 /*
  * Skip periodic load balancing when average system utilization is below this
  * threshold. The value is pre-scaled by userspace. 0 = disabled.
@@ -2369,6 +2372,7 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(lavd_init_task, struct task_struct *p,
 	/* Per-CPU warmth is task+CPU private -- never inherit it. */
 	taskc->cpu_heat = 0;
 	taskc->last_stopping_clk = scx_bpf_now();
+	taskc->numa_nid = NUMA_NO_NODE;
 
 	bpf_rcu_read_lock();
 	set_affinity_flags(taskc, p->cpus_ptr);
@@ -2911,6 +2915,9 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(lavd_init)
 	err = init_per_cpu_ctx(now);
 	if (err)
 		return err;
+
+	if (numa_on)
+		update_numa_summary();
 	warn_cpufreq_rate_limit_err();
 
 	/*

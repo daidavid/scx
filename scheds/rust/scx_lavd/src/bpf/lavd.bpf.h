@@ -228,7 +228,8 @@ struct task_ctx {
 	volatile u32	cpdom_id;		/* chosen compute domain id at ops.enqueue() */
 	volatile u32	suggested_cpu_id;	/* suggested CPU ID at ops.enqueue() and ops.select_cpu() */
 	volatile s32	pinned_cpu_id;		/* pinned CPU id. -ENOENT if not pinned or not runnable. */
-	u32	__pad0;
+	s16	numa_nid;		/* NUMA home node, NUMA_NO_NODE if none */
+	u8	__pad0[2];
 	u64	last_running_clk;	/* last time when scheduled in */
 	u64	run_freq;		/* scheduling frequency in a second */
 	u64	wait_freq;		/* waiting frequency in a second */
@@ -599,6 +600,9 @@ extern const volatile u8	cpu_turbo[LAVD_CPU_ID_MAX];
 extern const volatile bool	no_wake_sync;
 extern const volatile bool	no_slice_boost;
 extern const volatile u8	verbose;
+extern const volatile u8	numa_on; /* keep tasks on their NUMA home node */
+extern volatile u32		numa_cap_active[LAVD_NUMA_ID_MAX]; /* capacity of each node's active CPUs */
+extern volatile u8		numa_has_cpus[LAVD_NUMA_ID_MAX]; /* the node has an online CPU */
 
 #define debugln(fmt, ...)						\
 ({									\
@@ -828,6 +832,18 @@ u32 preemption_vulnerability(u16 normalized_lat_cri, u32 util_est)
 	return lat_step * LAVD_VULN_THRESH_UTIL_STEPS + util_step;
 }
 
+/* NUMA node of @cpu, from its compute domain. */
+static inline s32 cpu_to_numa_id(s32 cpu)
+{
+	struct cpu_ctx *cpuc = get_cpu_ctx_id(cpu);
+	struct cpdom_ctx *cpdomc;
+
+	if (!cpuc)
+		return NUMA_NO_NODE;
+	cpdomc = MEMBER_VPTR(cpdom_ctxs, [cpuc->cpdom_id]);
+	return cpdomc ? cpdomc->numa_id : NUMA_NO_NODE;
+}
+
 /*
  * Does the predicted wait for @cpu to free up fit the task's warmth-extended
  * budget? The base budget is warm_cpu_ns; warm cache and TLB state on @cpu
@@ -946,6 +962,7 @@ ovrflw_test_and_clear(struct bpf_cpumask *ovrflw, s32 cpu)
 /* Load balancer helpers. */
 
 int plan_x_cpdom_migration(void);
+void update_numa_summary(void);
 
 /* Preemption management helpers. */
 void shrink_slice_at_tick(struct task_struct *p, struct cpu_ctx *cpuc, u64 now);

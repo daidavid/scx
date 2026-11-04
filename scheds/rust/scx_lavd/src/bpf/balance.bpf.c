@@ -154,6 +154,60 @@ reset_role:
 	return 0;
 }
 
+/*
+ * Per-node summary, refreshed every interval: whether the node has an
+ * online CPU, and the capacity of its active CPUs, where a parked or
+ * offlined domain counts nothing. Summed into temporaries first so that
+ * a reader never sees a partial sum.
+ */
+volatile u8 numa_has_cpus[LAVD_NUMA_ID_MAX];
+volatile u32 numa_cap_active[LAVD_NUMA_ID_MAX];
+static u8 numa_has_cpus_tmp[LAVD_NUMA_ID_MAX];
+static u32 numa_cap_active_tmp[LAVD_NUMA_ID_MAX];
+static volatile u32 numa_summary_busy;
+
+__hidden
+void update_numa_summary(void)
+{
+	struct cpdom_ctx *cpdomc;
+	u64 cpdom_id;
+	int nid;
+
+	/* The timer and a hotplug update can race here. */
+	if (__sync_val_compare_and_swap(&numa_summary_busy, 0, 1))
+		return;
+
+	bpf_for(nid, 0, LAVD_NUMA_ID_MAX) {
+		numa_has_cpus_tmp[nid] = 0;
+		numa_cap_active_tmp[nid] = 0;
+	}
+
+	bpf_rcu_read_lock();
+	bpf_for(cpdom_id, 0, nr_cpdoms) {
+		struct bpf_cpumask *cpd_mask;
+
+		if (cpdom_id >= LAVD_CPDOM_MAX_NR)
+			break;
+		cpdomc = MEMBER_VPTR(cpdom_ctxs, [cpdom_id]);
+		cpd_mask = MEMBER_VPTR(cpdom_cpumask, [cpdom_id]);
+		if (!cpdomc || !cpd_mask || !cpdomc->is_valid ||
+		    bpf_cpumask_empty(cast_mask(cpd_mask)))
+			continue;
+		numa_has_cpus_tmp[cpdomc->numa_id] = 1;
+		if (!READ_ONCE(cpdomc->nr_active_cpus))
+			continue;
+		numa_cap_active_tmp[cpdomc->numa_id] += READ_ONCE(cpdomc->cap_sum_active_cpus);
+	}
+	bpf_rcu_read_unlock();
+
+	bpf_for(nid, 0, LAVD_NUMA_ID_MAX) {
+		WRITE_ONCE(numa_has_cpus[nid], numa_has_cpus_tmp[nid]);
+		WRITE_ONCE(numa_cap_active[nid], numa_cap_active_tmp[nid]);
+	}
+
+	WRITE_ONCE(numa_summary_busy, 0);
+}
+
 __weak
 int plan_x_cpdom_migration(void)
 {
