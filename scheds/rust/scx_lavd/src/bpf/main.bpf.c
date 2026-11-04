@@ -1823,9 +1823,14 @@ void BPF_STRUCT_OPS(lavd_running, struct task_struct *p)
 		return;
 	}
 
-	/* Policies change without a callback; refresh once a second. */
-	if (numa_on && now - taskc->numa_pol_clk >= LAVD_TIME_ONE_SEC)
-		numa_refresh_policy(p, taskc, now);
+	if (numa_on) {
+		/* Policies change without a callback; refresh once a second. */
+		if (now - taskc->numa_pol_clk >= LAVD_TIME_ONE_SEC)
+			numa_refresh_policy(p, taskc, now);
+		/* A new task makes its home where it first runs. */
+		if (taskc->numa_nid < 0)
+			taskc->numa_nid = cpu_to_numa_id(cpuc->cpu_id);
+	}
 
 	unaccount_queued_load(taskc);
 	unaccount_queued_load_pcpu(taskc);
@@ -2274,6 +2279,21 @@ void BPF_STRUCT_OPS(lavd_cpu_release, s32 cpu,
 	scx_bpf_reenqueue_local();
 }
 
+/*
+ * An exec drops the old address space. The new one is first touched on
+ * the CPU the exec runs on, so that becomes the home. Runs as @p.
+ */
+SEC("?tp_btf/sched_process_exec")
+int BPF_PROG(lavd_numa_exec, struct task_struct *p, pid_t old_pid,
+	     struct linux_binprm *bprm)
+{
+	task_ctx *taskc = find_task_ctx(p);
+
+	if (taskc && !taskc->numa_policy)
+		taskc->numa_nid = cpu_to_numa_id(bpf_get_smp_processor_id());
+	return 0;
+}
+
 SEC("?tp_btf/sched_switch")
 int BPF_PROG(lavd_sched_switch, bool preempt,
 	     struct task_struct *prev, struct task_struct *next,
@@ -2438,8 +2458,12 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(lavd_init_task, struct task_struct *p,
 	taskc->last_stopping_clk = scx_bpf_now();
 	taskc->numa_nid = NUMA_NO_NODE;
 	taskc->numa_policy = 0;
-	if (numa_on)
+	if (numa_on) {
 		numa_refresh_policy(p, taskc, scx_bpf_now());
+		/* At attach the memory was first touched where the task is. */
+		if (taskc->numa_nid < 0 && !args->fork)
+			taskc->numa_nid = cpu_to_numa_id(scx_bpf_task_cpu(p));
+	}
 
 	bpf_rcu_read_lock();
 	set_affinity_flags(taskc, p->cpus_ptr);
