@@ -936,6 +936,110 @@ found:
 	return cpu;
 }
 
+/* An idle CPU the task may use on node @nid, searched domain by domain. */
+static s32 pick_idle_cpu_on_node(struct pick_ctx *ctx, s32 nid, u64 scope)
+{
+	struct cpdom_ctx *cpdomc;
+	s32 cpu;
+	u64 id;
+
+	/* No active CPU in the task's affinity: nothing to search. */
+	if (!ctx->a_mask)
+		return -ENOENT;
+
+	bpf_for(id, 0, nr_cpdoms) {
+		if (id >= LAVD_CPDOM_MAX_NR)
+			break;
+		cpdomc = MEMBER_VPTR(cpdom_ctxs, [id]);
+		if (!cpdomc || !cpdomc->is_valid || cpdomc->numa_id != nid ||
+		    !cpdomc->nr_active_cpus || !cpdom_has_idle_cpu(id))
+			continue;
+		cpu = pick_idle_cpu_in(id, cast_mask(ctx->a_mask), scope);
+		if (cpu >= 0)
+			return cpu;
+	}
+	return -ENOENT;
+}
+
+/* How many of the task's active CPUs are in @mask. */
+static u32 nr_task_cpus_in(struct pick_ctx *ctx, struct bpf_cpumask *mask)
+{
+	if (!mask)
+		return 0;
+	bpf_cpumask_and(ctx->temp_mask, cast_mask(mask), cast_mask(ctx->a_mask));
+	return bpf_cpumask_weight(cast_mask(ctx->temp_mask));
+}
+
+/*
+ * A new task starts on the forking CPU's node, unless another node has
+ * more idle CPUs and either leads by more than LAVD_NUMA_IMB_MIN or this
+ * node already runs numa_imb_nr tasks. Only active CPUs the task may use
+ * count. The other node looked at is that of the domain with the most
+ * idle CPUs.
+ */
+static __noinline
+s32 pick_idle_cpu_at_fork(struct pick_ctx *ctx)
+{
+	u32 l_nr = 0, l_idle = 0, o_nr = 0, o_idle = 0, d_idle, d_max = 0;
+	s32 l_nid, o_nid = NUMA_NO_NODE, cpu;
+	struct cpdom_ctx *cpdomc;
+	u64 id;
+
+	if (!numa_on || !(ctx->wake_flags & SCX_WAKE_FORK) ||
+	    ctx->taskc->numa_nid >= 0 || !ctx->a_mask)
+		return -ENOENT;
+	l_nid = cpu_to_numa_id(ctx->prev_cpu);
+	if (l_nid < 0)
+		return -ENOENT;
+
+	bpf_for(id, 0, nr_cpdoms) {
+		if (id >= LAVD_CPDOM_MAX_NR)
+			break;
+		cpdomc = MEMBER_VPTR(cpdom_ctxs, [id]);
+		if (!cpdomc || !cpdomc->is_valid || !cpdomc->nr_active_cpus)
+			continue;
+		d_idle = nr_task_cpus_in(ctx, MEMBER_VPTR(cpdom_idle_cpumask, [id]));
+		if (cpdomc->numa_id == l_nid) {
+			l_idle += d_idle;
+			l_nr += nr_task_cpus_in(ctx, MEMBER_VPTR(cpdom_cpumask, [id]));
+		} else if (d_idle > d_max) {
+			d_max = d_idle;
+			o_nid = cpdomc->numa_id;
+		}
+	}
+	if (o_nid < 0)
+		return -ENOENT;
+
+	bpf_for(id, 0, nr_cpdoms) {
+		if (id >= LAVD_CPDOM_MAX_NR)
+			break;
+		cpdomc = MEMBER_VPTR(cpdom_ctxs, [id]);
+		if (!cpdomc || !cpdomc->is_valid || !cpdomc->nr_active_cpus ||
+		    cpdomc->numa_id != o_nid)
+			continue;
+		o_idle += nr_task_cpus_in(ctx, MEMBER_VPTR(cpdom_idle_cpumask, [id]));
+		o_nr += nr_task_cpus_in(ctx, MEMBER_VPTR(cpdom_cpumask, [id]));
+	}
+
+	/*
+	 * Core compaction can leave the nodes unevenly active: scale the
+	 * other node's idle CPUs to this node's active ones.
+	 */
+	if (l_idle && o_nr > l_nr)
+		o_idle = (u64)o_idle * l_nr / o_nr;
+
+	if (o_idle <= l_idle)
+		return -ENOENT;
+	if (l_idle && o_idle - l_idle <= LAVD_NUMA_IMB_MIN &&
+	    (l_nr > l_idle ? l_nr - l_idle : 0) < numa_imb_nr)
+		return -ENOENT;
+
+	cpu = pick_idle_cpu_on_node(ctx, o_nid, SCX_PICK_IDLE_CORE);
+	if (cpu < 0)
+		cpu = pick_idle_cpu_on_node(ctx, o_nid, 0);
+	return cpu;
+}
+
 __hidden __noinline
 s32 pick_idle_cpu(struct pick_ctx *ctx, bool extend_ovrflw, bool *is_idle)
 {
@@ -1097,6 +1201,11 @@ s32 pick_idle_cpu(struct pick_ctx *ctx, bool extend_ovrflw, bool *is_idle)
 		if (!repartition_masks_for_latency(ctx))
 			goto err_out;
 	}
+
+	/* A new task may start on another node. */
+	cpu = pick_idle_cpu_at_fork(ctx);
+	if (cpu >= 0)
+		goto idle_out;
 
 	/*
 	 * Find a sticky cpu and domain considering the core & task type

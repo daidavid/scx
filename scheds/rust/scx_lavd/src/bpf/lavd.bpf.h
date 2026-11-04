@@ -133,6 +133,7 @@ enum consts_internal {
 
 	LAVD_LB_NEAR_DIST		= 1,	/* force stealing scans only the nearest distance */
 	LAVD_FORCE_STEAL_BACKOFF_NS	= 1000000ULL,	/* 1 ms */
+	LAVD_NUMA_IMB_MIN		= 2,	/* idle CPU lead a new task ignores */
 
 	LAVD_FUTEX_OP_INVALID		= -1,
 };
@@ -603,6 +604,7 @@ extern const volatile bool	no_wake_sync;
 extern const volatile bool	no_slice_boost;
 extern const volatile u8	verbose;
 extern const volatile u8	numa_on; /* keep tasks on their NUMA home node */
+extern const volatile u32	numa_imb_nr; /* tasks a node runs before a new task looks elsewhere */
 extern volatile u8		numa_has_cpus[LAVD_NUMA_ID_MAX]; /* the node has an online CPU */
 
 #define debugln(fmt, ...)						\
