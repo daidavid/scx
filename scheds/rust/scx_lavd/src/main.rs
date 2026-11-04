@@ -825,6 +825,13 @@ impl<'a> Scheduler<'a> {
             && cpu_nodes.len() > 1
             && cpu_nodes.iter().all(|n| mem_nodes.contains(n));
         rodata.numa_on = numa_on as u8;
+        rodata.numa_nr_nids = order
+            .cpdom_map
+            .keys()
+            .map(|k| k.numa_adx)
+            .max()
+            .unwrap_or(0) as u32
+            + 1;
         info!("NUMA locality: {}", if numa_on { "on" } else { "off" });
         if numa_on {
             compat::cond_tracepoint_enable("sched:sched_process_exec", &skel.progs.lavd_numa_exec)?;

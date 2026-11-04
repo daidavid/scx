@@ -230,7 +230,7 @@ struct task_ctx {
 	volatile s32	pinned_cpu_id;		/* pinned CPU id. -ENOENT if not pinned or not runnable. */
 	s16	numa_nid;		/* NUMA home node, NUMA_NO_NODE if none */
 	u8	numa_policy;		/* the home comes from a memory policy or cpuset */
-	u8	__pad0;
+	u8	numa_exec;		/* placed on a node at exec, settles at the next pick */
 	u64	last_running_clk;	/* last time when scheduled in */
 	u64	run_freq;		/* scheduling frequency in a second */
 	u64	wait_freq;		/* waiting frequency in a second */
@@ -604,8 +604,10 @@ extern const volatile bool	no_wake_sync;
 extern const volatile bool	no_slice_boost;
 extern const volatile u8	verbose;
 extern const volatile u8	numa_on; /* keep tasks on their NUMA home node */
+extern const volatile u32	numa_nr_nids; /* node ids in use: the highest plus one */
 extern volatile u32		numa_cap_active[LAVD_NUMA_ID_MAX]; /* capacity of each node's active CPUs */
 extern volatile u8		numa_has_cpus[LAVD_NUMA_ID_MAX]; /* the node has an online CPU */
+extern volatile u64		numa_load_invr[LAVD_NUMA_ID_MAX]; /* load of each node's active domains */
 
 #define debugln(fmt, ...)						\
 ({									\
@@ -1040,5 +1042,15 @@ bool consume_task(u64 cpdom_id);
 
 extern u64 cur_logical_clk;
 u64 calc_when_to_run(struct task_struct *p, task_ctx *taskc);
+
+/* A task placed at exec settles on the node of @cpu, unless a policy names its home. */
+static inline void numa_settle_on(task_ctx *taskc, s32 cpu)
+{
+	if (!taskc->numa_exec)
+		return;
+	taskc->numa_exec = 0;
+	if (!taskc->numa_policy)
+		taskc->numa_nid = cpu_to_numa_id(cpu);
+}
 
 #endif /* __LAVD_H */

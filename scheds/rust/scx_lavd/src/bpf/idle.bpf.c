@@ -945,7 +945,7 @@ static s32 pick_idle_cpu_at_home(struct pick_ctx *ctx)
 {
 	struct cpdom_ctx *cpdomc;
 	s32 nid = ctx->taskc->numa_nid, cpu;
-	u64 id;
+	u64 id, scope;
 
 	if (!numa_on || nid < 0 || cpu_to_numa_id(ctx->prev_cpu) == nid)
 		return -ENOENT;
@@ -953,6 +953,8 @@ static s32 pick_idle_cpu_at_home(struct pick_ctx *ctx)
 	if (!ctx->a_mask)
 		return -ENOENT;
 
+	/* A task placed at exec has no cache footprint to keep. */
+	scope = ctx->taskc->numa_exec ? 0 : SCX_PICK_IDLE_CORE;
 	bpf_for(id, 0, nr_cpdoms) {
 		if (id >= LAVD_CPDOM_MAX_NR)
 			break;
@@ -960,7 +962,7 @@ static s32 pick_idle_cpu_at_home(struct pick_ctx *ctx)
 		if (!cpdomc || !cpdomc->is_valid || cpdomc->numa_id != nid ||
 		    !cpdomc->nr_active_cpus || !cpdom_has_idle_cpu(id))
 			continue;
-		cpu = pick_idle_cpu_in(id, cast_mask(ctx->a_mask), SCX_PICK_IDLE_CORE);
+		cpu = pick_idle_cpu_in(id, cast_mask(ctx->a_mask), scope);
 		if (cpu >= 0)
 			return cpu;
 	}
@@ -1076,7 +1078,7 @@ s32 pick_idle_cpu(struct pick_ctx *ctx, bool extend_ovrflw, bool *is_idle)
 	 * core type matches the task type; otherwise fall through to allow a
 	 * cross-cluster migration.
 	 */
-	if (warm_cpu_ns && ctx->prev_cpu >= 0 &&
+	if (warm_cpu_ns && !ctx->taskc->numa_exec && ctx->prev_cpu >= 0 &&
 	    bpf_cpumask_test_cpu(ctx->prev_cpu, cast_mask(ctx->active)) &&
 	    bpf_cpumask_test_cpu(ctx->prev_cpu, ctx->p->cpus_ptr)) {
 		if (claim_idle_cpu(ctx->prev_cpu)) {
@@ -1339,6 +1341,7 @@ unlock_out:
 	 */
 	if (cpu < 0)
 		cpu = pick_random_cpu(ctx);
+	numa_settle_on(ctx->taskc, cpu);
 
 	bpf_rcu_read_unlock();
 

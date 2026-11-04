@@ -238,6 +238,7 @@ const volatile u64	warm_cpu_ns = 0;
 
 /* Keep tasks on their NUMA home node; set when the machine has more than one node. */
 const volatile u8	numa_on = 0;
+const volatile u32	numa_nr_nids = 1;
 
 /*
  * Skip periodic load balancing when average system utilization is below this
@@ -944,7 +945,7 @@ void BPF_STRUCT_OPS(lavd_enqueue, struct task_struct *p, u64 enq_flags)
 {
 	struct cpu_ctx *cpuc, *cpuc_cur;
 	s32 task_cpu, cpu = -ENOENT;
-	bool is_idle = false;
+	bool is_idle = false, numa_exec;
 	task_ctx *taskc;
 	u64 dsq_id;
 
@@ -955,6 +956,7 @@ void BPF_STRUCT_OPS(lavd_enqueue, struct task_struct *p, u64 enq_flags)
 		return;
 	}
 	task_cpu = scx_bpf_task_cpu(p);
+	numa_exec = taskc->numa_exec;
 
 	/*
 	 * A reenqueue (SCX_ENQ_REENQ) means the task was already placed once
@@ -1145,6 +1147,13 @@ void BPF_STRUCT_OPS(lavd_enqueue, struct task_struct *p, u64 enq_flags)
 	}
 	account_queued_load(taskc, cpuc->cpdom_id);
 
+	/*
+	 * The CPU a task placed at exec leaves is about to idle. Have it
+	 * dispatch once more in case the task was queued back on it.
+	 */
+	if (unlikely(numa_exec && (enq_flags & SCX_ENQ_LAST)))
+		scx_bpf_kick_cpu(cpuc_cur->cpu_id, SCX_KICK_IDLE);
+
 kick_cpu_out:
 	/*
 	 * Kick @cpu if it was claimed idle or is marked idle; a hint
@@ -1308,6 +1317,14 @@ void consume_prev(struct task_struct *prev, task_ctx *taskc_prev, struct cpu_ctx
 
 	taskc_prev = taskc_prev ?: get_task_ctx(prev);
 	if (!taskc_prev)
+		return;
+
+	/*
+	 * A task placed on another node at exec is not kept here: with its
+	 * slice left at zero the kernel enqueues it again, and the pick
+	 * moves it, see numa_place_on_exec().
+	 */
+	if (unlikely(taskc_prev->numa_exec))
 		return;
 
 	/*
@@ -1830,6 +1847,8 @@ void BPF_STRUCT_OPS(lavd_running, struct task_struct *p)
 		/* A new task makes its home where it first runs. */
 		if (taskc->numa_nid < 0)
 			taskc->numa_nid = cpu_to_numa_id(cpuc->cpu_id);
+		/* A task placed at exec that runs again without a pick stays. */
+		numa_settle_on(taskc, cpuc->cpu_id);
 	}
 
 	unaccount_queued_load(taskc);
@@ -1918,6 +1937,10 @@ void BPF_STRUCT_OPS(lavd_tick, struct task_struct *p)
 		preempt_at_tick(p, cpuc);
 		return;
 	}
+
+	/* A task placed at exec keeps its slice at zero until it moves. */
+	if (unlikely(taskc->numa_exec))
+		return;
 
 	/*
 	 * If there is a pinned task on this CPU, shrink its time slice.
@@ -2279,18 +2302,134 @@ void BPF_STRUCT_OPS(lavd_cpu_release, s32 cpu,
 	scx_bpf_reenqueue_local();
 }
 
+/* Whether the node set @mems, 0 for any, allows node @nid. */
+static bool numa_mems_allow(u32 nid, u64 mems)
+{
+	return !mems || (nid < 64 && (mems >> nid) & 1);
+}
+
 /*
- * An exec drops the old address space. The new one is first touched on
- * the CPU the exec runs on, so that becomes the home. Runs as @p.
+ * The nodes 0-63 with a CPU in @p's affinity, met with the node set
+ * @mems, 0 for any: a task confined to some nodes is placed among them.
  */
+static u64 numa_nodes_allowed(struct task_struct *p, u64 mems)
+{
+	struct cpdom_ctx *cpdomc;
+	struct bpf_cpumask *mask;
+	u64 nodes = 0, id;
+
+	if (!is_affinitized(p))
+		return mems;
+
+	bpf_rcu_read_lock();
+	for (id = 0; id < nr_cpdoms && id < LAVD_CPDOM_MAX_NR && can_loop; id++) {
+		cpdomc = MEMBER_VPTR(cpdom_ctxs, [id]);
+		mask = MEMBER_VPTR(cpdom_cpumask, [id]);
+		if (!cpdomc || !mask || !cpdomc->is_valid || cpdomc->numa_id >= 64)
+			continue;
+		if (bpf_cpumask_intersects(cast_mask(mask), p->cpus_ptr))
+			nodes |= 1ULL << cpdomc->numa_id;
+	}
+	bpf_rcu_read_unlock();
+	return mems ? mems & nodes : nodes;
+}
+
+/* Rotates the node the search below starts from across execs. */
+static volatile u32 numa_exec_rr;
+
+/*
+ * The node with the least load per unit of active capacity among those
+ * @mems allows. Nodes within a sixteenth of each other tie, and the tie
+ * goes to the search order, rotated across execs so that an idle machine
+ * spreads new processes.
+ */
+static s32 numa_least_loaded_node(u64 mems)
+{
+	u64 best = (u64)-1, load;
+	s32 best_nid = NUMA_NO_NODE;
+	u32 nr_nids = min(numa_nr_nids, LAVD_NUMA_ID_MAX);
+	u32 nr = 0, start, rank = 0, seen = 0, nid, cap, i;
+
+	/*
+	 * Plain loops over a bound the verifier knows: the counters below
+	 * keep an open-coded iterator from ever converging.
+	 */
+	for (i = 0; i < nr_nids && can_loop; i++) {
+		if (READ_ONCE(numa_cap_active[i]) && numa_mems_allow(i, mems))
+			nr++;
+	}
+	if (!nr)
+		return NUMA_NO_NODE;
+	start = __sync_fetch_and_add(&numa_exec_rr, 1) % nr;
+
+	/* Two passes: the first skips the nodes ranked before @start. */
+	for (i = 0; i < 2 * nr_nids && can_loop; i++) {
+		if (seen >= nr)
+			break;
+		nid = i < nr_nids ? i : i - nr_nids;
+		if (nid >= LAVD_NUMA_ID_MAX)
+			break;
+		cap = READ_ONCE(numa_cap_active[nid]);
+		if (!cap || !numa_mems_allow(nid, mems))
+			continue;
+		if (rank < start) {
+			rank++;
+			continue;
+		}
+		seen++;
+		load = (READ_ONCE(numa_load_invr[nid]) << 10) / cap;
+		if (load + (load >> 4) < best) {
+			best = load;
+			best_nid = nid;
+		}
+	}
+	return best_nid;
+}
+
+/*
+ * An exec drops the old address space; the new one is first touched on
+ * whichever node the task runs on next, so it can change node for free.
+ * Take the least loaded node, or the policy node, and when it is not the
+ * current one kick the CPU: consume_prev() leaves the slice at zero, the
+ * kernel enqueues the task again, and the pick moves it before it returns
+ * to user space. The node it lands on becomes its home either way, see
+ * numa_settle_on().
+ */
+static void numa_place_on_exec(struct task_struct *p)
+{
+	task_ctx *taskc = find_task_ctx(p);
+	s32 nid, cur_nid = cpu_to_numa_id(bpf_get_smp_processor_id());
+	u64 nodes;
+
+	/* Only a task on sched_ext; a running one is queued. */
+	if (!taskc || !(p->scx.flags & SCX_TASK_QUEUED))
+		return;
+	/* numactl sets the policy right before the exec. */
+	numa_refresh_policy(p, taskc, scx_bpf_now());
+	nodes = numa_nodes_allowed(p, taskc->numa_mems);
+	if (taskc->numa_policy) {
+		nid = taskc->numa_nid;
+	} else {
+		taskc->numa_nid = cur_nid;
+		nid = numa_least_loaded_node(nodes);
+		if (nid < 0)
+			return;
+		taskc->numa_nid = nid;
+	}
+	/* Only a move the pick can make: an active CPU there the task may use. */
+	if (nid < 0 || nid >= LAVD_NUMA_ID_MAX || nid == cur_nid ||
+	    !READ_ONCE(numa_cap_active[nid]) || !numa_mems_allow(nid, nodes))
+		return;
+	taskc->numa_exec = 1;
+	scx_bpf_kick_cpu(bpf_get_smp_processor_id(), SCX_KICK_PREEMPT);
+}
+
+/* Fires only for an exec that succeeded, as @p. */
 SEC("?tp_btf/sched_process_exec")
 int BPF_PROG(lavd_numa_exec, struct task_struct *p, pid_t old_pid,
 	     struct linux_binprm *bprm)
 {
-	task_ctx *taskc = find_task_ctx(p);
-
-	if (taskc && !taskc->numa_policy)
-		taskc->numa_nid = cpu_to_numa_id(bpf_get_smp_processor_id());
+	numa_place_on_exec(p);
 	return 0;
 }
 
@@ -2458,6 +2597,7 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(lavd_init_task, struct task_struct *p,
 	taskc->last_stopping_clk = scx_bpf_now();
 	taskc->numa_nid = NUMA_NO_NODE;
 	taskc->numa_policy = 0;
+	taskc->numa_exec = 0;
 	if (numa_on) {
 		numa_refresh_policy(p, taskc, scx_bpf_now());
 		/* At attach the memory was first touched where the task is. */

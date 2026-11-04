@@ -156,14 +156,16 @@ reset_role:
 
 /*
  * Per-node summary, refreshed every interval: whether the node has an
- * online CPU, and the capacity of its active CPUs, where a parked or
- * offlined domain counts nothing. Summed into temporaries first so that
- * a reader never sees a partial sum.
+ * online CPU, and the load and capacity of its active domains, where a
+ * parked or offlined domain counts nothing. Summed into temporaries
+ * first so that a reader never sees a partial sum.
  */
 volatile u8 numa_has_cpus[LAVD_NUMA_ID_MAX];
 volatile u32 numa_cap_active[LAVD_NUMA_ID_MAX];
+volatile u64 numa_load_invr[LAVD_NUMA_ID_MAX];
 static u8 numa_has_cpus_tmp[LAVD_NUMA_ID_MAX];
 static u32 numa_cap_active_tmp[LAVD_NUMA_ID_MAX];
+static u64 numa_load_invr_tmp[LAVD_NUMA_ID_MAX];
 static volatile u32 numa_summary_busy;
 
 __hidden
@@ -180,6 +182,7 @@ void update_numa_summary(void)
 	bpf_for(nid, 0, LAVD_NUMA_ID_MAX) {
 		numa_has_cpus_tmp[nid] = 0;
 		numa_cap_active_tmp[nid] = 0;
+		numa_load_invr_tmp[nid] = 0;
 	}
 
 	bpf_rcu_read_lock();
@@ -197,12 +200,14 @@ void update_numa_summary(void)
 		if (!READ_ONCE(cpdomc->nr_active_cpus))
 			continue;
 		numa_cap_active_tmp[cpdomc->numa_id] += READ_ONCE(cpdomc->cap_sum_active_cpus);
+		numa_load_invr_tmp[cpdomc->numa_id] += READ_ONCE(cpdomc->load_invr);
 	}
 	bpf_rcu_read_unlock();
 
 	bpf_for(nid, 0, LAVD_NUMA_ID_MAX) {
 		WRITE_ONCE(numa_has_cpus[nid], numa_has_cpus_tmp[nid]);
 		WRITE_ONCE(numa_cap_active[nid], numa_cap_active_tmp[nid]);
+		WRITE_ONCE(numa_load_invr[nid], numa_load_invr_tmp[nid]);
 	}
 
 	WRITE_ONCE(numa_summary_busy, 0);
