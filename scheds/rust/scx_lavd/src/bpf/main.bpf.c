@@ -843,6 +843,117 @@ static int cgroup_throttled(struct task_struct *p, task_ctx *taskc, bool put_asi
 	return ret;
 }
 
+/*
+ * Fields and policy modes that exist only with CONFIG_NUMA and
+ * CONFIG_CPUSETS, declared here so that a kernel built without them
+ * still compiles and loads. The modes are those whose node mask the
+ * kernel sets; MPOL_LOCAL leaves its mask uninitialized.
+ */
+struct mempolicy___numa {
+	unsigned short mode;
+	nodemask_t nodes;
+} __attribute__((preserve_access_index));
+
+struct task_struct___numa {
+	/* int or u8 by kernel version; unsigned lets CO-RE resize the load. */
+	u32 on_cpu;
+	struct mempolicy___numa *mempolicy;
+	nodemask_t mems_allowed;
+	seqcount_spinlock_t mems_allowed_seq;
+} __attribute__((preserve_access_index));
+
+enum {
+	LAVD_MPOL_PREFERRED		= 1,
+	LAVD_MPOL_BIND			= 2,
+	LAVD_MPOL_INTERLEAVE		= 3,
+	LAVD_MPOL_PREFERRED_MANY	= 5,
+	LAVD_MPOL_WEIGHTED_INTERLEAVE	= 6,
+};
+
+/* The node of the single set bit of @mask, or NUMA_NO_NODE. */
+static s32 numa_single_node(u64 mask)
+{
+	if (!mask || (mask & (mask - 1)))
+		return NUMA_NO_NODE;
+	return __builtin_popcountll(mask - 1);
+}
+
+/*
+ * A memory policy or a cpuset can name the node a task's memory is on: a
+ * bound, preferred or interleaved single node, or a cpuset that allows
+ * one node. Record it as the home when the node has CPUs. Node ids above
+ * 63 are not looked at.
+ */
+static void numa_refresh_policy(struct task_struct *p, task_ctx *taskc, u64 now)
+{
+	const struct task_struct___numa *pn = (const void *)p;
+	struct mempolicy___numa *pol = NULL;
+	u64 mems = 0;
+	s32 nid = NUMA_NO_NODE;
+	u32 seq = 0;
+	u16 mode;
+
+	if (bpf_core_field_exists(pn->mems_allowed)) {
+		seq = BPF_CORE_READ(pn, mems_allowed_seq.seqcount.sequence);
+		mems = BPF_CORE_READ(pn, mems_allowed.bits[0]);
+	}
+
+	if (bpf_core_field_exists(pn->mempolicy))
+		pol = BPF_CORE_READ(pn, mempolicy);
+	if (pol) {
+		mode = BPF_CORE_READ(pol, mode);
+		if (mode == LAVD_MPOL_PREFERRED || mode == LAVD_MPOL_BIND ||
+		    mode == LAVD_MPOL_INTERLEAVE ||
+		    mode == LAVD_MPOL_PREFERRED_MANY ||
+		    mode == LAVD_MPOL_WEIGHTED_INTERLEAVE)
+			nid = numa_single_node(BPF_CORE_READ(pol, nodes.bits[0]));
+	}
+	/*
+	 * A cpuset rewrites the allowed nodes and rebinds the policy under
+	 * this sequence count, from another task. If it moved, read again
+	 * at the next call.
+	 */
+	if (bpf_core_field_exists(pn->mems_allowed) &&
+	    ((seq & 1) ||
+	     seq != BPF_CORE_READ(pn, mems_allowed_seq.seqcount.sequence)))
+		return;
+	taskc->numa_pol_clk = now;
+
+	if (nid < 0)
+		nid = numa_single_node(mems);
+	if (nid >= 0 && (nid >= LAVD_NUMA_ID_MAX || !READ_ONCE(numa_has_cpus[nid])))
+		nid = NUMA_NO_NODE;
+
+	/* A lifted policy keeps the home: the memory stays where it is. */
+	taskc->numa_policy = nid >= 0;
+	if (nid >= 0)
+		taskc->numa_nid = nid;
+}
+
+/*
+ * Re-read the policy at most once a second. Only the task itself replaces
+ * its policy, and it frees the old one at once, so the policy of a task
+ * running on another CPU cannot be read. Call this under @p's pi_lock
+ * (ops.select_cpu) or rq lock (ops.enqueue): there a task that is off its
+ * CPU stays off. A task on a CPU is read only when it is the caller; with
+ * proxy execution a lock owner can be enqueued while it runs elsewhere.
+ */
+static void numa_update_policy(struct task_struct *p, task_ctx *taskc)
+{
+	const struct task_struct___numa *pn = (const void *)p;
+	u64 now;
+
+	if (!numa_on)
+		return;
+	now = scx_bpf_now();
+	if (now - taskc->numa_pol_clk < LAVD_TIME_ONE_SEC)
+		return;
+	if (bpf_core_field_exists(pn->on_cpu) && pn->on_cpu &&
+	    p != bpf_get_current_task_btf())
+		return;
+	numa_refresh_policy(p, taskc, now);
+}
+
 s32 BPF_STRUCT_OPS(lavd_select_cpu, struct task_struct *p, s32 prev_cpu,
 		   u64 wake_flags)
 {
@@ -860,6 +971,7 @@ s32 BPF_STRUCT_OPS(lavd_select_cpu, struct task_struct *p, s32 prev_cpu,
 
 	if (!ictx.taskc || !ictx.cpuc_cur)
 		return prev_cpu;
+	numa_update_policy(p, ictx.taskc);
 
 	/*
 	 * Check whether it is a synchronous wake-up to boost
@@ -955,6 +1067,7 @@ void BPF_STRUCT_OPS(lavd_enqueue, struct task_struct *p, u64 enq_flags)
 		return;
 	}
 	task_cpu = scx_bpf_task_cpu(p);
+	numa_update_policy(p, taskc);
 
 	/*
 	 * A reenqueue (SCX_ENQ_REENQ) means the task was already placed once
@@ -2373,6 +2486,8 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(lavd_init_task, struct task_struct *p,
 	taskc->cpu_heat = 0;
 	taskc->last_stopping_clk = scx_bpf_now();
 	taskc->numa_nid = NUMA_NO_NODE;
+	taskc->numa_policy = 0;
+	taskc->numa_pol_clk = 0;
 
 	bpf_rcu_read_lock();
 	set_affinity_flags(taskc, p->cpus_ptr);
