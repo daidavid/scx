@@ -663,6 +663,22 @@ bool is_sync_wakeup(struct pick_ctx *ctx)
 	return true;
 }
 
+/*
+ * A task with a home follows a sync waker only to its own node or its
+ * previous CPU's. Followed anywhere else, the home pick would pull it
+ * back at its next wakeup and the task would change node every time.
+ */
+static __noinline
+bool numa_waker_declined(s32 nid, s32 prev_cpu, s32 waker_cpu)
+{
+	s32 waker_nid;
+
+	if (!numa_on || nid < 0)
+		return false;
+	waker_nid = cpu_to_numa_id(waker_cpu);
+	return waker_nid != nid && waker_nid != cpu_to_numa_id(prev_cpu);
+}
+
 static
 s32 find_sticky_cpu_and_cpdom(struct pick_ctx *ctx, s64 *sticky_cpdom)
 {
@@ -678,7 +694,9 @@ s32 find_sticky_cpu_and_cpdom(struct pick_ctx *ctx, s64 *sticky_cpdom)
 	test_cpu_stickable(ctx, &sctx, ctx->prev_cpu, ctx->is_task_big);
 	if (is_sync_wakeup(ctx)) {
 		s32 waker_cpu = bpf_get_smp_processor_id();
-		if (waker_cpu != ctx->prev_cpu) {
+		if (waker_cpu != ctx->prev_cpu &&
+		    !numa_waker_declined(ctx->taskc->numa_nid, ctx->prev_cpu,
+					 waker_cpu)) {
 			ctx->sync_waker_cpu = waker_cpu;
 			test_cpu_stickable(ctx, &sctx, ctx->sync_waker_cpu, ctx->is_task_big);
 		}
@@ -1040,6 +1058,20 @@ s32 pick_idle_cpu_at_fork(struct pick_ctx *ctx)
 	return cpu;
 }
 
+/*
+ * A fully idle core on the task's home node, for a task away from it.
+ * Nothing is preempted or swapped: a task that finds none stays where the
+ * ordinary pick puts it and is considered again at its next pick.
+ */
+static s32 pick_idle_cpu_at_home(struct pick_ctx *ctx)
+{
+	s32 nid = ctx->taskc->numa_nid;
+
+	if (!numa_on || nid < 0 || cpu_to_numa_id(ctx->prev_cpu) == nid)
+		return -ENOENT;
+	return pick_idle_cpu_on_node(ctx, nid, SCX_PICK_IDLE_CORE);
+}
+
 __hidden __noinline
 s32 pick_idle_cpu(struct pick_ctx *ctx, bool extend_ovrflw, bool *is_idle)
 {
@@ -1204,6 +1236,11 @@ s32 pick_idle_cpu(struct pick_ctx *ctx, bool extend_ovrflw, bool *is_idle)
 
 	/* A new task may start on another node. */
 	cpu = pick_idle_cpu_at_fork(ctx);
+	if (cpu >= 0)
+		goto idle_out;
+
+	/* Toward the home node, before the sticky domain anchors @p nearby. */
+	cpu = pick_idle_cpu_at_home(ctx);
 	if (cpu >= 0)
 		goto idle_out;
 
