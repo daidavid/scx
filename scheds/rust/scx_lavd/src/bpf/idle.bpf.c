@@ -1015,7 +1015,8 @@ s32 pick_idle_cpu_at_fork(struct pick_ctx *ctx)
 	struct cpdom_ctx *cpdomc;
 	u64 id;
 
-	if (!numa_on || !(ctx->wake_flags & SCX_WAKE_FORK) || !ctx->a_mask)
+	if (!numa_on || !(ctx->wake_flags & SCX_WAKE_FORK) ||
+	    ctx->taskc->numa_nid >= 0 || !ctx->a_mask)
 		return -ENOENT;
 	l_nid = cpu_to_numa_id(ctx->prev_cpu);
 	if (l_nid < 0)
