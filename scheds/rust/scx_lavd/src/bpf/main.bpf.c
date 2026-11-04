@@ -1742,6 +1742,66 @@ static __always_inline u32 task_cpuperf_demand(task_ctx *taskc)
 	return min(READ_ONCE(taskc->util_est), LAVD_SCALE);
 }
 
+/* task_struct fields that exist only with CONFIG_NUMA and CONFIG_CPUSETS. */
+struct task_struct___numa {
+	struct mempolicy *mempolicy;
+	nodemask_t mems_allowed;
+} __attribute__((preserve_access_index));
+
+/* The node of the single set bit of @mask, or NUMA_NO_NODE. */
+static s32 numa_single_node(u64 mask)
+{
+	if (!mask || (mask & (mask - 1)))
+		return NUMA_NO_NODE;
+	return __builtin_popcountll(mask - 1);
+}
+
+/*
+ * A memory policy or a cpuset can name the node a task's memory is on: a
+ * bound, preferred or interleaved single node, the home node of a bound
+ * or preferred-many policy, or a cpuset that allows one node. Record it
+ * as the home when the node has CPUs. The nodes a policy or cpuset
+ * allows are kept for the placement at exec. Node ids above 63 are not
+ * looked at.
+ */
+static void numa_refresh_policy(struct task_struct *p, task_ctx *taskc, u64 now)
+{
+	const struct task_struct___numa *pn = (const void *)p;
+	struct mempolicy *pol = NULL;
+	u64 mems = 0, nodes;
+	s32 nid = NUMA_NO_NODE;
+	u16 mode;
+
+	taskc->numa_pol_clk = now;
+	if (bpf_core_field_exists(pn->mems_allowed))
+		mems = BPF_CORE_READ(pn, mems_allowed.bits[0]);
+
+	if (bpf_core_field_exists(pn->mempolicy))
+		pol = BPF_CORE_READ(pn, mempolicy);
+	if (pol) {
+		mode = BPF_CORE_READ(pol, mode);
+		nodes = BPF_CORE_READ(pol, nodes.bits[0]);
+		if (mode == MPOL_BIND || mode == MPOL_PREFERRED_MANY ||
+		    mode == MPOL_INTERLEAVE || mode == MPOL_WEIGHTED_INTERLEAVE) {
+			if (nodes)
+				mems = mems ? (mems & nodes) : nodes;
+			nid = BPF_CORE_READ(pol, home_node);
+		}
+		if (nid < 0)
+			nid = numa_single_node(nodes);
+	}
+	taskc->numa_mems = mems;
+	if (nid < 0)
+		nid = numa_single_node(mems);
+	if (nid >= 0 && (nid >= LAVD_NUMA_ID_MAX || !READ_ONCE(numa_has_cpus[nid])))
+		nid = NUMA_NO_NODE;
+
+	/* A lifted policy keeps the home: the memory stays where it is. */
+	taskc->numa_policy = nid >= 0;
+	if (nid >= 0)
+		taskc->numa_nid = nid;
+}
+
 void BPF_STRUCT_OPS(lavd_running, struct task_struct *p)
 {
 	struct cpu_ctx *cpuc;
@@ -1762,6 +1822,10 @@ void BPF_STRUCT_OPS(lavd_running, struct task_struct *p)
 		scx_bpf_error("Failed to lookup context for task %d", p->pid);
 		return;
 	}
+
+	/* Policies change without a callback; refresh once a second. */
+	if (numa_on && now - taskc->numa_pol_clk >= LAVD_TIME_ONE_SEC)
+		numa_refresh_policy(p, taskc, now);
 
 	unaccount_queued_load(taskc);
 	unaccount_queued_load_pcpu(taskc);
@@ -2373,6 +2437,9 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(lavd_init_task, struct task_struct *p,
 	taskc->cpu_heat = 0;
 	taskc->last_stopping_clk = scx_bpf_now();
 	taskc->numa_nid = NUMA_NO_NODE;
+	taskc->numa_policy = 0;
+	if (numa_on)
+		numa_refresh_policy(p, taskc, scx_bpf_now());
 
 	bpf_rcu_read_lock();
 	set_affinity_flags(taskc, p->cpus_ptr);
