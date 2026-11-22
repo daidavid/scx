@@ -609,7 +609,15 @@ extern const volatile u8	numa_on; /* keep tasks on their NUMA home node */
 extern const volatile u32	numa_imb_nr; /* tasks a node runs before a new task looks elsewhere */
 extern volatile u8		numa_has_cpus[LAVD_NUMA_ID_MAX]; /* the node has an online CPU */
 extern volatile u8		numa_has_stealee[LAVD_NUMA_ID_MAX]; /* a stealee cpdom is on the node */
+extern volatile u32		numa_cap_active[LAVD_NUMA_ID_MAX]; /* capacity of the node's active CPUs */
 extern const volatile u8	numa_balancing; /* ops.set_numa_node() is installed */
+extern volatile u8		numa_balancing_on; /* kernel.numa_balancing is on */
+
+/* Whether the kernel runs NUMA balancing for lavd's tasks right now. */
+static inline bool numa_balancing_active(void)
+{
+	return numa_balancing && READ_ONCE(numa_balancing_on);
+}
 
 #define debugln(fmt, ...)						\
 ({									\

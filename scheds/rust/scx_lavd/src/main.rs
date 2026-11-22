@@ -230,7 +230,9 @@ struct Opts {
     /// kernel.numa_balancing is on, the kernel then
     /// scans the memory of the scheduler's tasks, migrates their pages
     /// toward the node they run on and reports the node it prefers for
-    /// each task, which becomes the task's home node.
+    /// each task, which becomes the task's home node. Load is then
+    /// balanced within each node only, except away from a node with no
+    /// active CPU.
     #[clap(long = "no-numa-balancing", action = clap::ArgAction::SetTrue)]
     no_numa_balancing: bool,
 
@@ -246,7 +248,9 @@ struct Opts {
 
     /// Default: --no-force-steal-limit is deactivated (force stealing is limited).
     /// Let force stealing scan every distance and NUMA node on each dispatch,
-    /// with no rate limit.
+    /// with no rate limit. While the kernel runs NUMA balancing for the
+    /// scheduler's tasks (see --no-numa-balancing), it steals from another
+    /// node only when that node has no active CPU.
     #[clap(long = "no-force-steal-limit", action = clap::ArgAction::SetTrue)]
     no_force_steal_limit: bool,
 
@@ -804,6 +808,23 @@ impl<'a> Scheduler<'a> {
             .is_some_and(|mode| mode & 1 != 0)
     }
 
+    /// Follow kernel.numa_balancing at run time: load moves across nodes
+    /// again while it is off.
+    fn refresh_numa_balancing(&mut self) {
+        if self.skel.maps.rodata_data.as_ref().unwrap().numa_balancing == 0 {
+            return;
+        }
+        let on = Self::numa_balancing_sysctl_on() as u8;
+        let bss_data = self.skel.maps.bss_data.as_mut().unwrap();
+        if bss_data.numa_balancing_on != on {
+            info!(
+                "Kernel NUMA balancing: {}",
+                if on != 0 { "on" } else { "off" }
+            );
+            bss_data.numa_balancing_on = on;
+        }
+    }
+
     /// Tasks a node may run before a new task looks at another node: the
     /// number of LLCs in a node, or an eighth of its CPUs when it has a
     /// single LLC.
@@ -877,6 +898,7 @@ impl<'a> Scheduler<'a> {
         }
         rodata.numa_balancing = numa_balancing as u8;
         let numa_scanning = numa_balancing && Self::numa_balancing_sysctl_on();
+        bss_data.numa_balancing_on = numa_scanning as u8;
         info!(
             "NUMA locality: {}",
             match (numa_on, numa_balancing, numa_scanning) {
@@ -1236,6 +1258,7 @@ impl<'a> Scheduler<'a> {
                 }
             }
             self.cleanup_introspec();
+            self.refresh_numa_balancing();
         }
 
         bpf_streams::dump_bpf_streams(&mut self.skel);

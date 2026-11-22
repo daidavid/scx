@@ -241,6 +241,8 @@ const volatile u8	numa_on = 0;
 const volatile u32	numa_imb_nr = 1;
 /* ops.set_numa_node() is installed: the kernel runs NUMA balancing for lavd's tasks. */
 const volatile u8	numa_balancing = 0;
+/* kernel.numa_balancing is on, followed at run time by userspace. */
+volatile u8		numa_balancing_on = 0;
 
 /*
  * Skip periodic load balancing when average system utilization is below this

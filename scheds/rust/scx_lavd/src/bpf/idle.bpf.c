@@ -932,6 +932,17 @@ s32 migrate_to_neighbor(struct pick_ctx *ctx, struct cpdom_ctx *cpdc,
 			if (unlikely(!mig_cpdc))
 				continue;
 
+			/*
+			 * NUMA balancing: neither the donation, which is
+			 * stealing at wakeup, nor the fallback walk leaves the
+			 * node. A neighbor on another node does not count as
+			 * having an idle CPU either, so that the caller skips
+			 * a second walk it could not use.
+			 */
+			if (numa_balancing_active() &&
+			    mig_cpdc->numa_id != cpdc->numa_id)
+				continue;
+
 			if (!cpdom_has_idle_cpu(mig_cpdom))
 				continue;
 			nbr_has_idle = true;
@@ -1163,7 +1174,9 @@ s32 pick_idle_cpu(struct pick_ctx *ctx, bool extend_ovrflw, bool *is_idle)
 	 * the sticky domain is chosen: a new task may start on a node with
 	 * more idle CPUs, and a task away from its home node takes a fully
 	 * idle core there. For 6), a task with a home follows a sync waker
-	 * only to its home node or its previous CPU's.
+	 * only to its home node or its previous CPU's. For 7), a neighbor
+	 * on another node is skipped while the kernel runs NUMA balancing
+	 * for the scheduler's tasks.
 	 *
 	 * Idle states come from per-domain idle masks, which are hints. A CPU
 	 * is used as idle only after it is claimed by atomically clearing its
@@ -1415,7 +1428,7 @@ s32 pick_idle_cpu(struct pick_ctx *ctx, bool extend_ovrflw, bool *is_idle)
 	 * sticky domain. On a heterogeneous system, the completion-time
 	 * estimate picks the neighbor instead, as for the donation above.
 	 * Skip the walk when the donation already found no idle CPU in any
-	 * neighbor.
+	 * neighbor it may use.
 	 */
 	if ((nr_cpdoms > 1) && !nbr_busy &&
 	    (cpdc = MEMBER_VPTR(cpdom_ctxs, [sticky_cpdom]))) {
@@ -1437,7 +1450,8 @@ s32 pick_idle_cpu(struct pick_ctx *ctx, bool extend_ovrflw, bool *is_idle)
 	 *  2) There is no idle CPU, not even a partially idle one, in the
 	 *     active/overflow set of the sticky domain.
 	 *  3) There is no idle CPU, not even a partially idle one, in the
-	 *     active/overflow set of any neighbor.
+	 *     active/overflow set of any neighbor, or of any neighbor on
+	 *     the sticky domain's node under NUMA balancing.
 	 *  4) However, CPUs outside the active/overflow set, in the sticky
 	 *     domain or a neighbor, may still be idle. We don't even know
 	 *     whether there is any idle CPU in the system.
