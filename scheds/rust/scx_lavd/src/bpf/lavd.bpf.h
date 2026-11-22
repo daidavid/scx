@@ -231,7 +231,7 @@ struct task_ctx {
 	volatile s32	pinned_cpu_id;		/* pinned CPU id. -ENOENT if not pinned or not runnable. */
 	s16	numa_nid;		/* NUMA home node, NUMA_NO_NODE if none */
 	u8	numa_policy;		/* the home comes from a memory policy or cpuset */
-	u8	__pad0;
+	u8	numa_measured;		/* the kernel measured a node for the task since it started or exec'd */
 	u64	last_running_clk;	/* last time when scheduled in */
 	u64	run_freq;		/* scheduling frequency in a second */
 	u64	wait_freq;		/* waiting frequency in a second */
@@ -607,6 +607,7 @@ extern const volatile u8	numa_on; /* keep tasks on their NUMA home node */
 extern const volatile u32	numa_imb_nr; /* tasks a node runs before a new task looks elsewhere */
 extern volatile u8		numa_has_cpus[LAVD_NUMA_ID_MAX]; /* the node has an online CPU */
 extern volatile u8		numa_has_stealee[LAVD_NUMA_ID_MAX]; /* a stealee cpdom is on the node */
+extern const volatile u8	numa_balancing; /* ops.set_numa_node() is installed */
 
 #define debugln(fmt, ...)						\
 ({									\

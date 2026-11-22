@@ -239,6 +239,8 @@ const volatile u64	warm_cpu_ns = 0;
 /* Keep tasks on their NUMA home node; set when more than one node has CPUs and each has memory. */
 const volatile u8	numa_on = 0;
 const volatile u32	numa_imb_nr = 1;
+/* ops.set_numa_node() is installed: the kernel runs NUMA balancing for lavd's tasks. */
+const volatile u8	numa_balancing = 0;
 
 /*
  * Skip periodic load balancing when average system utilization is below this
@@ -953,6 +955,16 @@ static s32 numa_measured_node(const struct task_struct *p, s32 nid)
 	return idx;
 }
 
+/* Take @nid, a node the kernel measured, as the home; a policy home stays. */
+static void numa_set_measured(task_ctx *taskc, s32 nid)
+{
+	if (nid < 0)
+		return;
+	if (!taskc->numa_policy)
+		taskc->numa_nid = nid;
+	taskc->numa_measured = 1;
+}
+
 /*
  * Re-read the policy at most once a second. Only the task itself replaces
  * its policy, and it frees the old one at once, so the policy of a task
@@ -975,6 +987,17 @@ static void numa_update_policy(struct task_struct *p, task_ctx *taskc)
 	    p != bpf_get_current_task_btf())
 		return;
 	numa_refresh_policy(p, taskc, now);
+
+	/*
+	 * After ops.enable() the kernel reports a node only when it changes
+	 * it. The node a task inherited and then confirms with faults of its
+	 * own is not reported again, so read the node here until the first
+	 * one is measured.
+	 */
+	if (numa_balancing && !taskc->numa_measured &&
+	    bpf_core_field_exists(pn->numa_preferred_nid))
+		numa_set_measured(taskc, numa_measured_node(p,
+				  BPF_CORE_READ(pn, numa_preferred_nid)));
 }
 
 s32 BPF_STRUCT_OPS(lavd_select_cpu, struct task_struct *p, s32 prev_cpu,
@@ -2347,6 +2370,24 @@ void BPF_STRUCT_OPS(lavd_set_cpumask, struct task_struct *p,
 	set_affinity_flags(taskc, cpumask);
 }
 
+/*
+ * With this callback installed the kernel runs NUMA balancing for lavd's
+ * tasks and reports the node it prefers for @p, under @p's rq lock: the
+ * current one after every ops.enable(), then each new one. A measured
+ * node becomes the home, unless a memory policy names the home.
+ */
+void BPF_STRUCT_OPS(lavd_set_numa_node, struct task_struct *p, s32 nid)
+{
+	task_ctx *taskc = get_task_ctx(p);
+
+	if (!taskc) {
+		scx_bpf_error("task_ctx_stor first lookup failed");
+		return;
+	}
+
+	numa_set_measured(taskc, numa_measured_node(p, nid));
+}
+
 void BPF_STRUCT_OPS(lavd_cpu_release, s32 cpu,
 		    struct scx_cpu_release_args *args)
 {
@@ -2390,6 +2431,7 @@ int BPF_PROG(lavd_numa_exec, struct task_struct *p, pid_t old_pid,
 	numa_refresh_policy(p, taskc, scx_bpf_now());
 	if (!taskc->numa_policy)
 		taskc->numa_nid = cpu_to_numa_id(bpf_get_smp_processor_id());
+	taskc->numa_measured = 0;
 	return 0;
 }
 
@@ -2557,6 +2599,7 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(lavd_init_task, struct task_struct *p,
 	taskc->last_stopping_clk = scx_bpf_now();
 	taskc->numa_nid = NUMA_NO_NODE;
 	taskc->numa_policy = 0;
+	taskc->numa_measured = 0;
 	taskc->numa_pol_clk = 0;
 	/*
 	 * At attach the memory is on the node the kernel's NUMA balancing
@@ -2570,6 +2613,8 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(lavd_init_task, struct task_struct *p,
 					BPF_CORE_READ(pn, numa_preferred_nid));
 		if (taskc->numa_nid < 0)
 			taskc->numa_nid = cpu_to_numa_id(scx_bpf_task_cpu(p));
+		else
+			taskc->numa_measured = 1;
 	}
 
 	bpf_rcu_read_lock();
@@ -3234,6 +3279,7 @@ SCX_OPS_DEFINE(lavd_ops,
 	       .cpu_offline		= (void *)lavd_cpu_offline,
 	       .update_idle		= (void *)lavd_update_idle,
 	       .set_cpumask		= (void *)lavd_set_cpumask,
+	       .set_numa_node		= (void *)lavd_set_numa_node,
 	       .cpu_release		= (void *)lavd_cpu_release,
 	       .enable			= (void *)lavd_enable,
 	       .init_task		= (void *)lavd_init_task,

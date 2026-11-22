@@ -219,11 +219,20 @@ struct Opts {
 
     /// Do not keep tasks on their NUMA home node. By default, on a machine
     /// with more than one NUMA node, a task's home node comes from its memory
-    /// policy, from what the kernel's NUMA balancing measured before the
-    /// scheduler attached or from where it first ran, and the CPU pick
-    /// prefers an idle core on it.
+    /// policy, from the kernel's NUMA balancing or from where it first ran,
+    /// and the CPU pick prefers an idle core on it.
     #[clap(long = "no-numa-locality", action = clap::ArgAction::SetTrue)]
     no_numa_locality: bool,
+
+    /// Do not have the kernel run NUMA balancing for the scheduler's tasks.
+    /// By default, with NUMA locality on and a kernel that has
+    /// ops.set_numa_node(), the scheduler installs it. While
+    /// kernel.numa_balancing is on, the kernel then
+    /// scans the memory of the scheduler's tasks, migrates their pages
+    /// toward the node they run on and reports the node it prefers for
+    /// each task, which becomes the task's home node.
+    #[clap(long = "no-numa-balancing", action = clap::ArgAction::SetTrue)]
+    no_numa_balancing: bool,
 
     /// Do not boost futex holders.
     #[clap(long = "no-futex-boost", action = clap::ArgAction::SetTrue)]
@@ -786,6 +795,15 @@ impl<'a> Scheduler<'a> {
             .unwrap_or_default()
     }
 
+    /// Whether kernel.numa_balancing has NUMA_BALANCING_NORMAL set. Only
+    /// with this bit does the kernel's scan cover ordinary memory.
+    fn numa_balancing_sysctl_on() -> bool {
+        std::fs::read_to_string("/proc/sys/kernel/numa_balancing")
+            .ok()
+            .and_then(|s| s.trim().parse::<u32>().ok())
+            .is_some_and(|mode| mode & 1 != 0)
+    }
+
     /// Tasks a node may run before a new task looks at another node: the
     /// number of LLCs in a node, or an eighth of its CPUs when it has a
     /// single LLC.
@@ -846,7 +864,28 @@ impl<'a> Scheduler<'a> {
             && cpu_nodes.iter().all(|n| mem_nodes.contains(n));
         rodata.numa_on = numa_on as u8;
         rodata.numa_imb_nr = Self::numa_imb_nr(order);
-        info!("NUMA locality: {}", if numa_on { "on" } else { "off" });
+        // With ops.set_numa_node() installed the kernel runs NUMA balancing
+        // for our tasks and reports the node it prefers for each. Leave it
+        // unset on a kernel without it or without NUMA balancing, and when
+        // it is not wanted, so that the kernel does not scan.
+        let numa_balancing = numa_on
+            && !opts.no_numa_balancing
+            && compat::struct_has_field("sched_ext_ops", "set_numa_node").unwrap_or(false)
+            && compat::struct_has_field("task_struct", "numa_preferred_nid").unwrap_or(false);
+        if !numa_balancing {
+            skel.struct_ops.lavd_ops_mut().set_numa_node = std::ptr::null_mut();
+        }
+        rodata.numa_balancing = numa_balancing as u8;
+        let numa_scanning = numa_balancing && Self::numa_balancing_sysctl_on();
+        info!(
+            "NUMA locality: {}",
+            match (numa_on, numa_balancing, numa_scanning) {
+                (false, _, _) => "off",
+                (true, false, _) => "on",
+                (true, true, true) => "on, with the kernel's NUMA balancing",
+                (true, true, false) => "on (kernel.numa_balancing is off)",
+            }
+        );
         if numa_on {
             compat::cond_tracepoint_enable("sched:sched_process_exec", &skel.progs.lavd_numa_exec)?;
         }
