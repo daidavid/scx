@@ -677,16 +677,20 @@ bool is_sync_wakeup(struct pick_ctx *ctx)
  * A task with a home follows a sync waker only to its own node or its
  * previous CPU's. Followed anywhere else, the home pick would pull it
  * back at its next wakeup and the task would change node every time.
+ * Nor does the task follow a waker to a home the kernel just changed
+ * until that home has settled.
  */
 static __noinline
-bool numa_waker_declined(s32 nid, s32 prev_cpu, s32 waker_cpu)
+bool numa_waker_declined(s32 nid, u64 settle_clk, s32 prev_cpu, s32 waker_cpu)
 {
 	s32 waker_nid;
 
 	if (!numa_on || nid < 0)
 		return false;
 	waker_nid = cpu_to_numa_id(waker_cpu);
-	return waker_nid != nid && waker_nid != cpu_to_numa_id(prev_cpu);
+	if (waker_nid == cpu_to_numa_id(prev_cpu))
+		return false;
+	return waker_nid != nid || time_before(scx_bpf_now(), settle_clk);
 }
 
 static
@@ -705,8 +709,9 @@ s32 find_sticky_cpu_and_cpdom(struct pick_ctx *ctx, s64 *sticky_cpdom)
 	if (is_sync_wakeup(ctx)) {
 		s32 waker_cpu = bpf_get_smp_processor_id();
 		if (waker_cpu != ctx->prev_cpu &&
-		    !numa_waker_declined(ctx->taskc->numa_nid, ctx->prev_cpu,
-					 waker_cpu)) {
+		    !numa_waker_declined(ctx->taskc->numa_nid,
+					 ctx->taskc->numa_settle_clk,
+					 ctx->prev_cpu, waker_cpu)) {
 			ctx->sync_waker_cpu = waker_cpu;
 			test_cpu_stickable(ctx, &sctx, ctx->sync_waker_cpu, ctx->is_task_big);
 		}
@@ -1081,6 +1086,10 @@ static s32 pick_idle_cpu_at_home(struct pick_ctx *ctx)
 	volatile u8 *has_stealee;
 
 	if (!numa_on || nid < 0 || cpu_to_numa_id(ctx->prev_cpu) == nid)
+		return -ENOENT;
+
+	/* A home the kernel just changed has to settle first. */
+	if (time_before(scx_bpf_now(), ctx->taskc->numa_settle_clk))
 		return -ENOENT;
 
 	/*

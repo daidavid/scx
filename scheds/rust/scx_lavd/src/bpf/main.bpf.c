@@ -931,8 +931,10 @@ static void numa_refresh_policy(struct task_struct *p, task_ctx *taskc, u64 now)
 
 	/* A lifted policy keeps the home: the memory stays where it is. */
 	taskc->numa_policy = nid >= 0;
-	if (nid >= 0)
+	if (nid >= 0) {
 		taskc->numa_nid = nid;
+		taskc->numa_settle_clk = 0;
+	}
 }
 
 /*
@@ -960,8 +962,18 @@ static void numa_set_measured(task_ctx *taskc, s32 nid)
 {
 	if (nid < 0)
 		return;
-	if (!taskc->numa_policy)
+	if (!taskc->numa_policy) {
+		/*
+		 * The first node the kernel measures is acted on at the
+		 * next pick. A changed one has to hold for a while first:
+		 * it may flip back, and a move across nodes is then paid
+		 * twice.
+		 */
+		if (taskc->numa_measured && taskc->numa_nid != nid)
+			taskc->numa_settle_clk = scx_bpf_now() +
+						 LAVD_NUMA_SETTLE_NS;
 		taskc->numa_nid = nid;
+	}
 	taskc->numa_measured = 1;
 }
 
@@ -2432,6 +2444,7 @@ int BPF_PROG(lavd_numa_exec, struct task_struct *p, pid_t old_pid,
 	if (!taskc->numa_policy)
 		taskc->numa_nid = cpu_to_numa_id(bpf_get_smp_processor_id());
 	taskc->numa_measured = 0;
+	taskc->numa_settle_clk = 0;
 	return 0;
 }
 
@@ -2601,6 +2614,7 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(lavd_init_task, struct task_struct *p,
 	taskc->numa_policy = 0;
 	taskc->numa_measured = 0;
 	taskc->numa_pol_clk = 0;
+	taskc->numa_settle_clk = 0;
 	/*
 	 * At attach the memory is on the node the kernel's NUMA balancing
 	 * measured for the task, or else where the task is.

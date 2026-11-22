@@ -134,6 +134,7 @@ enum consts_internal {
 	LAVD_LB_NEAR_DIST		= 1,	/* force stealing scans only the nearest distance */
 	LAVD_FORCE_STEAL_BACKOFF_NS	= 1000000ULL,	/* 1 ms */
 	LAVD_NUMA_IMB_MIN		= 2,	/* idle CPU lead a new task ignores */
+	LAVD_NUMA_SETTLE_NS		= LAVD_TIME_ONE_SEC, /* a home the kernel changed is acted on once it held this long */
 
 	LAVD_FUTEX_OP_INVALID		= -1,
 };
@@ -264,6 +265,7 @@ struct task_ctx {
 	pid_t	pid;			/* pid for this task */
 	pid_t	waker_pid;		/* last waker's PID */
 	u64	numa_pol_clk;		/* last memory policy refresh */
+	u64	numa_settle_clk;	/* until then a home the kernel changed is not acted on */
 
 	/* --- cacheline 5 boundary (320 bytes): ravg/util read-mostly group --- */
 	u32	util_est __attribute__((aligned(CACHELINE_SIZE)));
