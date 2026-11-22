@@ -155,11 +155,14 @@ reset_role:
 }
 
 /*
- * Which nodes have an online CPU, refreshed every interval. Built in a
- * temporary first so that a reader never sees a node go missing.
+ * Per node, refreshed every interval: whether it has an online CPU, and
+ * whether one of its active domains is a stealee this round. Built in
+ * temporaries first so that a reader never sees a node go missing.
  */
 volatile u8 numa_has_cpus[LAVD_NUMA_ID_MAX];
+volatile u8 numa_has_stealee[LAVD_NUMA_ID_MAX];
 static u8 numa_has_cpus_tmp[LAVD_NUMA_ID_MAX];
+static u8 numa_has_stealee_tmp[LAVD_NUMA_ID_MAX];
 static volatile u32 numa_summary_busy;
 
 __hidden
@@ -173,8 +176,10 @@ void update_numa_summary(void)
 	if (__sync_val_compare_and_swap(&numa_summary_busy, 0, 1))
 		return;
 
-	bpf_for(nid, 0, LAVD_NUMA_ID_MAX)
+	bpf_for(nid, 0, LAVD_NUMA_ID_MAX) {
 		numa_has_cpus_tmp[nid] = 0;
+		numa_has_stealee_tmp[nid] = 0;
+	}
 
 	bpf_rcu_read_lock();
 	bpf_for(cpdom_id, 0, nr_cpdoms) {
@@ -188,11 +193,16 @@ void update_numa_summary(void)
 		    bpf_cpumask_empty(cast_mask(cpd_mask)))
 			continue;
 		numa_has_cpus_tmp[cpdomc->numa_id] = 1;
+		if (READ_ONCE(cpdomc->nr_active_cpus) &&
+		    READ_ONCE(cpdomc->is_stealee))
+			numa_has_stealee_tmp[cpdomc->numa_id] = 1;
 	}
 	bpf_rcu_read_unlock();
 
-	bpf_for(nid, 0, LAVD_NUMA_ID_MAX)
+	bpf_for(nid, 0, LAVD_NUMA_ID_MAX) {
 		WRITE_ONCE(numa_has_cpus[nid], numa_has_cpus_tmp[nid]);
+		WRITE_ONCE(numa_has_stealee[nid], numa_has_stealee_tmp[nid]);
+	}
 
 	WRITE_ONCE(numa_summary_busy, 0);
 }

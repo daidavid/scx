@@ -1077,8 +1077,18 @@ s32 pick_idle_cpu_at_fork(struct pick_ctx *ctx)
 static s32 pick_idle_cpu_at_home(struct pick_ctx *ctx)
 {
 	s32 nid = ctx->taskc->numa_nid;
+	volatile u8 *has_stealee;
 
 	if (!numa_on || nid < 0 || cpu_to_numa_id(ctx->prev_cpu) == nid)
+		return -ENOENT;
+
+	/*
+	 * Not onto a node with a domain the load balancer finds overloaded:
+	 * an idle core there is momentary, and the balancer would move the
+	 * task away again.
+	 */
+	has_stealee = MEMBER_VPTR(numa_has_stealee, [nid]);
+	if (!has_stealee || READ_ONCE(*has_stealee))
 		return -ENOENT;
 	return pick_idle_cpu_on_node(ctx, nid, SCX_PICK_IDLE_CORE);
 }

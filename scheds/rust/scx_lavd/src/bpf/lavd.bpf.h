@@ -604,6 +604,7 @@ extern const volatile u8	verbose;
 extern const volatile u8	numa_on; /* keep tasks on their NUMA home node */
 extern const volatile u32	numa_imb_nr; /* tasks a node runs before a new task looks elsewhere */
 extern volatile u8		numa_has_cpus[LAVD_NUMA_ID_MAX]; /* the node has an online CPU */
+extern volatile u8		numa_has_stealee[LAVD_NUMA_ID_MAX]; /* a stealee cpdom is on the node */
 
 #define debugln(fmt, ...)						\
 ({									\
