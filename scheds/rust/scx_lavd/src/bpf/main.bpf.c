@@ -844,6 +844,35 @@ static int cgroup_throttled(struct task_struct *p, task_ctx *taskc, bool put_asi
 	return ret;
 }
 
+/*
+ * Fields that exist only with CONFIG_NUMA_BALANCING, declared here so
+ * that a kernel built without it still compiles and loads.
+ */
+struct task_struct___numa {
+	int numa_preferred_nid;
+	unsigned long total_numa_faults;
+} __attribute__((preserve_access_index));
+
+/*
+ * @nid when the kernel's NUMA balancing measured it: a node with CPUs,
+ * for a task that took hinting faults itself. A task that shares its
+ * creator's memory starts with the creator's node and an exec keeps the
+ * old one, both without a fault behind them.
+ */
+static s32 numa_measured_node(const struct task_struct *p, s32 nid)
+{
+	const struct task_struct___numa *pn = (const void *)p;
+	/* Unsigned, so that the verifier keeps the range for the index. */
+	u32 idx = nid;
+
+	if (!bpf_core_field_exists(pn->total_numa_faults) ||
+	    !BPF_CORE_READ(pn, total_numa_faults))
+		return NUMA_NO_NODE;
+	if (idx >= LAVD_NUMA_ID_MAX || !READ_ONCE(numa_has_cpus[idx]))
+		return NUMA_NO_NODE;
+	return idx;
+}
+
 s32 BPF_STRUCT_OPS(lavd_select_cpu, struct task_struct *p, s32 prev_cpu,
 		   u64 wake_flags)
 {
@@ -2418,9 +2447,19 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(lavd_init_task, struct task_struct *p,
 	taskc->cpu_heat = 0;
 	taskc->last_stopping_clk = scx_bpf_now();
 	taskc->numa_nid = NUMA_NO_NODE;
-	/* At attach the memory was first touched where the task is. */
-	if (numa_on && !args->fork && !is_kernel_task(p))
-		taskc->numa_nid = cpu_to_numa_id(scx_bpf_task_cpu(p));
+	/*
+	 * At attach the memory is on the node the kernel's NUMA balancing
+	 * measured for the task, or else where the task is.
+	 */
+	if (numa_on && !args->fork && !is_kernel_task(p)) {
+		const struct task_struct___numa *pn = (const void *)p;
+
+		if (bpf_core_field_exists(pn->numa_preferred_nid))
+			taskc->numa_nid = numa_measured_node(p,
+					BPF_CORE_READ(pn, numa_preferred_nid));
+		if (taskc->numa_nid < 0)
+			taskc->numa_nid = cpu_to_numa_id(scx_bpf_task_cpu(p));
+	}
 
 	bpf_rcu_read_lock();
 	set_affinity_flags(taskc, p->cpus_ptr);
